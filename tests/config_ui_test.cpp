@@ -239,6 +239,26 @@ bool render_preview(AppState& app, const wchar_t* path) {
   return saved;
 }
 
+HWND scrollbar_face_at(HWND control, POINT point) {
+  for (auto child = GetWindow(GetParent(control), GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+    wchar_t klass[64]{};
+    GetClassNameW(child, klass, 64);
+    RECT bounds{};
+    GetWindowRect(child, &bounds);
+    if (std::wcscmp(klass, L"AggregateAudio.ScrollbarFace") == 0 &&
+        (GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE) && PtInRect(&bounds, point)) return child;
+  }
+  return nullptr;
+}
+
+bool scrollbar_pointer_down(HWND control, POINT point) {
+  const auto face = scrollbar_face_at(control, point);
+  if (!face) return false;
+  ScreenToClient(face, &point);
+  SendMessageW(face, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(point.x, point.y));
+  return true;
+}
+
 bool scrollbar_drag(HWND control, int bar, bool to_end, bool cancel = false) {
   SCROLLBARINFO info{sizeof(info)};
   SCROLLINFO before{sizeof(before), SIF_ALL};
@@ -248,8 +268,7 @@ bool scrollbar_drag(HWND control, int bar, bool to_end, bool cancel = false) {
   POINT thumb = bar == SB_VERT ? POINT{(info.rcScrollBar.left + info.rcScrollBar.right) / 2,
       info.rcScrollBar.top + axis} : POINT{info.rcScrollBar.left + axis,
       (info.rcScrollBar.top + info.rcScrollBar.bottom) / 2};
-  SendMessageW(control, WM_NCLBUTTONDOWN, bar == SB_VERT ? HTVSCROLL : HTHSCROLL,
-      MAKELPARAM(thumb.x, thumb.y));
+  if (!scrollbar_pointer_down(control, thumb)) return false;
   bool captured = GetCapture() == control;
   if (bar == SB_VERT) thumb.y = to_end ? info.rcScrollBar.bottom + 40 : info.rcScrollBar.top - 40;
   else thumb.x = to_end ? info.rcScrollBar.right + 40 : info.rcScrollBar.left - 40;
@@ -277,16 +296,14 @@ bool scrollbar_page_and_arrow(HWND control, int bar) {
       info.rcScrollBar.top + (info.xyThumbBottom + info.rcScrollBar.bottom - info.rcScrollBar.top - info.dxyLineButton) / 2} :
       POINT{info.rcScrollBar.left + (info.xyThumbBottom + info.rcScrollBar.right - info.rcScrollBar.left - info.dxyLineButton) / 2,
       (info.rcScrollBar.top + info.rcScrollBar.bottom) / 2};
-  SendMessageW(control, WM_NCLBUTTONDOWN, bar == SB_VERT ? HTVSCROLL : HTHSCROLL,
-      MAKELPARAM(point.x, point.y));
+  if (!scrollbar_pointer_down(control, point)) return false;
   SendMessageW(control, WM_LBUTTONUP, 0, 0);
   SCROLLINFO page{sizeof(page), SIF_POS};
   GetScrollInfo(control, bar, &page);
   GetScrollBarInfo(control, bar == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &info);
   if (bar == SB_VERT) point.y = info.rcScrollBar.top + info.dxyLineButton / 2;
   else point.x = info.rcScrollBar.left + info.dxyLineButton / 2;
-  SendMessageW(control, WM_NCLBUTTONDOWN, bar == SB_VERT ? HTVSCROLL : HTHSCROLL,
-      MAKELPARAM(point.x, point.y));
+  if (!scrollbar_pointer_down(control, point)) return false;
   SendMessageW(control, WM_LBUTTONUP, 0, 0);
   SCROLLINFO arrow{sizeof(arrow), SIF_POS};
   GetScrollInfo(control, bar, &arrow);

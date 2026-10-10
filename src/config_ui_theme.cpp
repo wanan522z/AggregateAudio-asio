@@ -144,15 +144,15 @@ LRESULT CALLBACK header_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
   return result;
 }
 
-// Keep the controls' real nonclient scrollbar geometry and scroll ranges. Only
-// the face and pointer tracking are themed; wheel/keyboard/accessibility still
-// use the native ListView and EDIT controls.
+// Preserve native ranges and scrolling, but present each scrollbar through an
+// opaque sibling window. Native SetScrollInfo drawing is clipped behind it.
 enum class ScrollPart { none, previous, next, page_previous, page_next, thumb };
 struct ScrollSkin {
   Theme* theme{};
   bool list{};
   bool redraw{true};
-  bool scrolling{};
+  HWND control{};
+  std::array<HWND, 2> faces{};
   int hot_bar{-1};
   ScrollPart hot{ScrollPart::none};
   int active_bar{-1};
@@ -260,10 +260,80 @@ void draw_scrollbars(HWND window, HDC dc, const ScrollSkin& skin) {
     fill(dc, {vertical.bar.left, horizontal.bar.top, vertical.bar.right, horizontal.bar.bottom}, kLog);
 }
 
+LRESULT CALLBACK scrollbar_face_proc(HWND face, UINT message, WPARAM wparam, LPARAM lparam) {
+  auto* skin = reinterpret_cast<ScrollSkin*>(GetWindowLongPtrW(face, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    skin = static_cast<ScrollSkin*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
+    SetWindowLongPtrW(face, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(skin));
+  }
+  if (!skin) return DefWindowProcW(face, message, wparam, lparam);
+  if (message == WM_ERASEBKGND) return 1;
+  if (message == WM_PAINT) {
+    PAINTSTRUCT paint{};
+    const auto dc = BeginPaint(face, &paint);
+    RECT client{}, owner{}, bounds{};
+    GetClientRect(face, &client);
+    GetWindowRect(face, &bounds);
+    GetWindowRect(skin->control, &owner);
+    const auto memory = CreateCompatibleDC(dc);
+    const auto bitmap = CreateCompatibleBitmap(dc, std::max(1L, client.right), std::max(1L, client.bottom));
+    if (memory && bitmap) {
+      const auto previous = SelectObject(memory, bitmap);
+      fill(memory, client, kLog);
+      SetViewportOrgEx(memory, owner.left - bounds.left, owner.top - bounds.top, nullptr);
+      draw_scrollbars(skin->control, memory, *skin);
+      SetViewportOrgEx(memory, 0, 0, nullptr);
+      BitBlt(dc, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
+      SelectObject(memory, previous);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    if (memory) DeleteDC(memory);
+    EndPaint(face, &paint);
+    return 0;
+  }
+  if (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK) {
+    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    ClientToScreen(face, &point);
+    const int bar = face == skin->faces[0] ? SB_VERT : SB_HORZ;
+    if (scroll_hit(skin->control, bar, point) == ScrollPart::none) return 0;
+    if (message == WM_MOUSEMOVE) {
+      TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, face, 0};
+      TrackMouseEvent(&track);
+    }
+    return SendMessageW(skin->control, message == WM_MOUSEMOVE ? WM_NCMOUSEMOVE :
+        message == WM_LBUTTONDOWN ? WM_NCLBUTTONDOWN : WM_NCLBUTTONDBLCLK,
+        bar == SB_VERT ? HTVSCROLL : HTHSCROLL, MAKELPARAM(point.x, point.y));
+  }
+  if (message == WM_MOUSELEAVE) return SendMessageW(skin->control, WM_NCMOUSELEAVE, 0, 0);
+  if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
+    return SendMessageW(skin->control, message, wparam, lparam);
+  if (message == WM_SETCURSOR) { SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return TRUE; }
+  return DefWindowProcW(face, message, wparam, lparam);
+}
+
 void repaint_scrollbars(HWND window, const ScrollSkin& skin) {
-  if (!skin.redraw || skin.scrolling || !(GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE)) return;
-  const auto dc = GetWindowDC(window);
-  if (dc) { draw_scrollbars(window, dc, skin); ReleaseDC(window, dc); }
+  if (!skin.redraw) return;
+  const bool visible = (GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE) != 0;
+  RECT owner{};
+  GetWindowRect(window, &owner);
+  MapWindowPoints(nullptr, GetParent(window), reinterpret_cast<POINT*>(&owner), 2);
+  for (int index = 0; index < 2; ++index) {
+    const auto face = skin.faces[index];
+    if (!face) continue;
+    ScrollGeometry geometry;
+    if (!visible || !scroll_geometry(window, index == 0 ? SB_VERT : SB_HORZ, geometry)) {
+      ShowWindow(face, SW_HIDE);
+      continue;
+    }
+    if (index == 0) {
+      ScrollGeometry horizontal;
+      if (scroll_geometry(window, SB_HORZ, horizontal)) geometry.bar.bottom = horizontal.bar.bottom;
+    }
+    SetWindowPos(face, HWND_TOP, owner.left + geometry.bar.left, owner.top + geometry.bar.top,
+        geometry.bar.right - geometry.bar.left, geometry.bar.bottom - geometry.bar.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RedrawWindow(face, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+  }
 }
 
 void scroll_step(HWND window, const ScrollSkin& skin) {
@@ -306,6 +376,7 @@ LRESULT CALLBACK scroll_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
   if (message == WM_NCDESTROY) {
     KillTimer(window, kScrollTimer);
     RemoveWindowSubclass(window, scroll_proc, id);
+    for (const auto face : skin.faces) if (IsWindow(face)) DestroyWindow(face);
     delete &skin;
     return DefSubclassProc(window, message, wparam, lparam);
   }
@@ -375,54 +446,12 @@ LRESULT CALLBACK scroll_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     repaint_scrollbars(window, skin);
     if (message == WM_LBUTTONUP) return 0;
   }
-  // Native controls redraw their scrollbar synchronously while changing its
-  // position, before our themed repaint. Batch the whole scroll operation so
-  // that the native face never reaches the screen between themed frames.
-  const bool scroll_message = message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL ||
-      message == WM_VSCROLL || message == WM_HSCROLL || message == LVM_SCROLL ||
-      message == EM_LINESCROLL || message == EM_SCROLLCARET;
-  if (scroll_message && skin.redraw && !skin.scrolling &&
-      (GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE)) {
-    skin.scrolling = true;
-    DefSubclassProc(window, WM_SETREDRAW, FALSE, 0);
-    const auto result = DefSubclassProc(window, message, wparam, lparam);
-    DefSubclassProc(window, WM_SETREDRAW, TRUE, 0);
-    skin.scrolling = false;
-    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
-    repaint_scrollbars(window, skin);
-    return result;
-  }
-  if (message == WM_NCPAINT && skin.redraw && !skin.scrolling) {
-    // Let the control paint its border, but exclude both themed scrollbar
-    // strips and their shared corner from the native nonclient paint region.
-    RECT bounds{};
-    GetWindowRect(window, &bounds);
-    const auto region = CreateRectRgn(0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top);
-    if (region) {
-      if (wparam != 1 && wparam != 0)
-        CombineRgn(region, region, reinterpret_cast<HRGN>(wparam), RGN_AND);
-      ScrollGeometry vertical, horizontal;
-      const bool has_vertical = scroll_geometry(window, SB_VERT, vertical);
-      const bool has_horizontal = scroll_geometry(window, SB_HORZ, horizontal);
-      const auto exclude = [&](RECT rect) {
-        const auto strip = CreateRectRgnIndirect(&rect);
-        if (strip) { CombineRgn(region, region, strip, RGN_DIFF); DeleteObject(strip); }
-      };
-      if (has_vertical) exclude(vertical.bar);
-      if (has_horizontal) exclude(horizontal.bar);
-      if (has_vertical && has_horizontal)
-        exclude({vertical.bar.left, horizontal.bar.top, vertical.bar.right, horizontal.bar.bottom});
-      const auto result = DefSubclassProc(window, message, reinterpret_cast<WPARAM>(region), lparam);
-      DeleteObject(region);
-      repaint_scrollbars(window, skin);
-      return result;
-    }
-  }
   const auto result = DefSubclassProc(window, message, wparam, lparam);
   if (message == WM_PRINT && (lparam & PRF_NONCLIENT)) {
     draw_scrollbars(window, reinterpret_cast<HDC>(wparam), skin);
   } else if (message == WM_NCPAINT || message == WM_PAINT || message == WM_SIZE ||
-      message == WM_NCMOUSEMOVE || message == WM_NCMOUSELEAVE ||
+      message == WM_NCMOUSEMOVE || message == WM_NCMOUSELEAVE || message == WM_SHOWWINDOW ||
+      message == WM_WINDOWPOSCHANGED ||
       message == WM_VSCROLL || message == WM_HSCROLL || message == WM_MOUSEWHEEL ||
       message == WM_MOUSEHWHEEL || message == WM_SETFONT || message == WM_ENABLE ||
       message == WM_SETTEXT || message == EM_REPLACESEL || message == EM_LINESCROLL ||
@@ -521,10 +550,24 @@ void Theme::style_scrollbars(HWND control) {
   SetWindowTheme(control, L"", L"");
   auto skin = std::make_unique<ScrollSkin>();
   skin->theme = this;
+  skin->control = control;
   std::array<wchar_t, 64> klass{};
   GetClassNameW(control, klass.data(), static_cast<int>(klass.size()));
   skin->list = std::wcscmp(klass.data(), WC_LISTVIEWW) == 0;
-  if (SetWindowSubclass(control, scroll_proc, 3, reinterpret_cast<DWORD_PTR>(skin.get()))) skin.release();
+  if (!SetWindowSubclass(control, scroll_proc, 3, reinterpret_cast<DWORD_PTR>(skin.get()))) return;
+  const auto instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(control, GWLP_HINSTANCE));
+  WNDCLASSW face_class{};
+  face_class.lpfnWndProc = scrollbar_face_proc;
+  face_class.hInstance = instance;
+  face_class.lpszClassName = L"AggregateAudio.ScrollbarFace";
+  face_class.style = CS_DBLCLKS;
+  RegisterClassW(&face_class);
+  SetWindowLongPtrW(control, GWL_STYLE, GetWindowLongPtrW(control, GWL_STYLE) | WS_CLIPSIBLINGS);
+  for (auto& face : skin->faces)
+    face = CreateWindowExW(0, face_class.lpszClassName, L"", WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, GetParent(control), nullptr, instance, skin.get());
+  repaint_scrollbars(control, *skin);
+  skin.release();
 }
 
 void Theme::update_list_images(HWND list) {

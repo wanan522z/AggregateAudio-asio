@@ -17,7 +17,7 @@ powered by WanAn522z
 
 ## 安装与使用
 
-使用打包生成的 `dist\AggregateAudio-v14-x64-Setup.exe`。安装程序包含 Microsoft x64 Visual C++ 运行库，注册 64 位 ASIO 驱动，并创建快捷方式和卸载入口。
+使用打包生成的 `dist\AggregateAudio-v15-x64-Setup.exe`。安装程序包含 Microsoft x64 Visual C++ 运行库，注册 64 位 ASIO 驱动，并创建快捷方式和卸载入口。
 
 1. 关闭 DAW 和配置窗口，运行 Setup 安装。
 2. 打开 Aggregate Audio 配置程序，展开设备并勾选需要的输入、输出声道。

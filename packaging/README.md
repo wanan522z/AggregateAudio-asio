@@ -1,6 +1,6 @@
 # Windows x64 installer
 
-The installer packages the hash-verified v14 release without rebuilding audio
+The installer packages the hash-verified v15 release without rebuilding audio
 code. It embeds the unchanged Microsoft-signed x64 VC++ redistributable so
 ASIO loading also works in hosts on a PC without developer tools. Runtime
 installation happens before application files and ASIO registration.
@@ -13,14 +13,14 @@ Build with the signed Inno Setup 7.1.0 compiler:
 
 Optional arguments: `-ReleaseNumber`, `-BinaryDirectory`, `-VerifiedManifest`,
 `-Compiler`, `-RuntimeInstaller`. The default release directory is
-`build\release-v14\Release`, verified against `packaging\verified-v14.psd1`.
+`build\release-v15\Release`, verified against `packaging\verified-v15.psd1`.
 The default compiler is the signed binary from the `Tools.InnoSetup` 7.1.0
 NuGet package extracted under `build\packaging-tools\inno-7.1.0`.
 The package is an unofficial redistribution; the compiler's Authenticode
 signature is checked before execution. The original Inno Setup tools are at
 <https://github.com/jrsoftware/issrc/releases/tag/is-7_1_0>.
 
-Output: `dist\AggregateAudio-v14-x64-Setup.exe`, installer SHA256, package
+Output: `dist\AggregateAudio-v15-x64-Setup.exe`, installer SHA256, package
 manifest and Chinese installation guide. The installer and product binaries
 are unsigned. No user audio profile, developer tools, test executables,
 kernel drivers, services or autostart entries are installed.
