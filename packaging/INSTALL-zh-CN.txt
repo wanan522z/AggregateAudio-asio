@@ -1,10 +1,10 @@
-Aggregate Audio v13 — Windows x64 测试版
+Aggregate Audio v14 — Windows x64 测试版
 
 适用：Windows 10 / 11 x64、64 位 ASIO 宿主（包括 FL Studio）。
 
 安装：
 1. 关闭使用 Aggregate Audio 的 DAW、设置面板和诊断工具。
-2. 运行 AggregateAudio-v13-x64-Setup.exe，允许管理员权限。
+2. 运行 AggregateAudio-v14-x64-Setup.exe，允许管理员权限。
 3. 安装包内置微软 Visual C++ x64 运行库，不需要联网下载或安装开发工具。
 4. 从开始菜单打开 Aggregate Audio，重新勾选这台电脑实际存在的输入、输出通道，保存设置。
 5. 在 FL Studio 的音频设置里选择 Aggregate Audio，打开面板检查采样率和缓冲。
@@ -25,7 +25,7 @@ Aggregate Audio v13 — Windows x64 测试版
 ASIO 运行时的通知区域图标、设备变化/流停滞自动恢复。虚拟通道功能已移除。
 v12 修正首次打开面板时日志覆盖设备页的问题，并在首次显示前完成 DPI 布局。
 后台设备刷新会保留当前浏览位置、选中通道及设备组折叠状态。
-v13 将设备列表横向、纵向及日志页滚动条统一为浅色轨道、圆角滑块。
+v14 将设备列表横向、纵向及日志页滚动条统一为浅色轨道、圆角滑块。
 支持滑块拖动、轨道翻页、箭头、滚轮和键盘导航，并随 DPI 调整样式。
 
 反作弊相关：

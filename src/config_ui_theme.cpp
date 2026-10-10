@@ -152,6 +152,7 @@ struct ScrollSkin {
   Theme* theme{};
   bool list{};
   bool redraw{true};
+  bool scrolling{};
   int hot_bar{-1};
   ScrollPart hot{ScrollPart::none};
   int active_bar{-1};
@@ -260,7 +261,7 @@ void draw_scrollbars(HWND window, HDC dc, const ScrollSkin& skin) {
 }
 
 void repaint_scrollbars(HWND window, const ScrollSkin& skin) {
-  if (!skin.redraw || !(GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE)) return;
+  if (!skin.redraw || skin.scrolling || !(GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE)) return;
   const auto dc = GetWindowDC(window);
   if (dc) { draw_scrollbars(window, dc, skin); ReleaseDC(window, dc); }
 }
@@ -373,6 +374,49 @@ LRESULT CALLBACK scroll_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     SendMessageW(window, bar == SB_VERT ? WM_VSCROLL : WM_HSCROLL, SB_ENDSCROLL, 0);
     repaint_scrollbars(window, skin);
     if (message == WM_LBUTTONUP) return 0;
+  }
+  // Native controls redraw their scrollbar synchronously while changing its
+  // position, before our themed repaint. Batch the whole scroll operation so
+  // that the native face never reaches the screen between themed frames.
+  const bool scroll_message = message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL ||
+      message == WM_VSCROLL || message == WM_HSCROLL || message == LVM_SCROLL ||
+      message == EM_LINESCROLL || message == EM_SCROLLCARET;
+  if (scroll_message && skin.redraw && !skin.scrolling &&
+      (GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE)) {
+    skin.scrolling = true;
+    DefSubclassProc(window, WM_SETREDRAW, FALSE, 0);
+    const auto result = DefSubclassProc(window, message, wparam, lparam);
+    DefSubclassProc(window, WM_SETREDRAW, TRUE, 0);
+    skin.scrolling = false;
+    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    repaint_scrollbars(window, skin);
+    return result;
+  }
+  if (message == WM_NCPAINT && skin.redraw && !skin.scrolling) {
+    // Let the control paint its border, but exclude both themed scrollbar
+    // strips and their shared corner from the native nonclient paint region.
+    RECT bounds{};
+    GetWindowRect(window, &bounds);
+    const auto region = CreateRectRgn(0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top);
+    if (region) {
+      if (wparam != 1 && wparam != 0)
+        CombineRgn(region, region, reinterpret_cast<HRGN>(wparam), RGN_AND);
+      ScrollGeometry vertical, horizontal;
+      const bool has_vertical = scroll_geometry(window, SB_VERT, vertical);
+      const bool has_horizontal = scroll_geometry(window, SB_HORZ, horizontal);
+      const auto exclude = [&](RECT rect) {
+        const auto strip = CreateRectRgnIndirect(&rect);
+        if (strip) { CombineRgn(region, region, strip, RGN_DIFF); DeleteObject(strip); }
+      };
+      if (has_vertical) exclude(vertical.bar);
+      if (has_horizontal) exclude(horizontal.bar);
+      if (has_vertical && has_horizontal)
+        exclude({vertical.bar.left, horizontal.bar.top, vertical.bar.right, horizontal.bar.bottom});
+      const auto result = DefSubclassProc(window, message, reinterpret_cast<WPARAM>(region), lparam);
+      DeleteObject(region);
+      repaint_scrollbars(window, skin);
+      return result;
+    }
   }
   const auto result = DefSubclassProc(window, message, wparam, lparam);
   if (message == WM_PRINT && (lparam & PRF_NONCLIENT)) {

@@ -304,7 +304,7 @@ int wmain(int argc, wchar_t** argv) {
   Gdiplus::GdiplusStartupInput input;
   ULONG_PTR token{};
   if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok) return 1;
-  INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+  INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_LINK_CLASS};
   InitCommonControlsEx(&controls);
   const auto instance = GetModuleHandleW(nullptr);
   WNDCLASSW klass{};
@@ -451,6 +451,20 @@ int wmain(int argc, wchar_t** argv) {
           "Scrollbar navigation preserves channel selection and routing");
       SendMessageW(window, WM_COMMAND, kSettings, 0);
       std::wstring lines;
+      const auto log_bounds = control_rect(window, app.status_log);
+      const auto link_bounds = control_rect(window, app.repository_link);
+      const auto credit_bounds = control_rect(window, app.attribution);
+      LITEM repository{};
+      repository.mask = LIF_ITEMINDEX | LIF_URL;
+      repository.iLink = 0;
+      check(app.repository_link && app.attribution &&
+          (GetWindowLongPtrW(app.repository_link, GWL_STYLE) & WS_VISIBLE) &&
+          (GetWindowLongPtrW(app.attribution, GWL_STYLE) & WS_VISIBLE) &&
+          SendMessageW(app.repository_link, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&repository)) &&
+          std::wcscmp(repository.szUrl, L"https://github.com/wanan522z/AggregateAudio-asio") == 0 &&
+          log_bounds.bottom <= link_bounds.top && link_bounds.bottom <= credit_bounds.top &&
+          credit_bounds.bottom <= app.log_card.bottom,
+          "Settings repository and attribution fit below the log at all DPIs");
       for (int line = 0; line < 300; ++line) lines += L"运行日志 scrollbar fixture " + std::to_wstring(line) + L"\r\n";
       SetWindowTextW(app.status_log, lines.c_str());
       SendMessageW(app.status_log, EM_SETSEL, 0, 0);
@@ -470,6 +484,9 @@ int wmain(int argc, wchar_t** argv) {
         check(render_preview(app, path.c_str()), "Themed log scrollbar preview");
       }
       SendMessageW(window, WM_COMMAND, kSettings, 0);
+      check(!(GetWindowLongPtrW(app.repository_link, GWL_STYLE) & WS_VISIBLE) &&
+          !(GetWindowLongPtrW(app.attribution, GWL_STYLE) & WS_VISIBLE),
+          "Device page hides Settings repository and attribution");
     }
     SendMessageW(window, WM_DPICHANGED, MAKELONG(96, 96), reinterpret_cast<LPARAM>(&normal));
     ListView_EnsureVisible(app.device_list, 27, FALSE);

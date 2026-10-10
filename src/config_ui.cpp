@@ -41,6 +41,7 @@ constexpr int kStatusLog = 1010;
 constexpr int kDeviceBuffer = 1011;
 constexpr int kActiveDevice = 1012;
 constexpr int kSettings = 1013;
+constexpr int kRepository = 1014;
 constexpr UINT_PTR kProbeTimer = 1;
 constexpr UINT_PTR kTrayTimer = 2;
 const UINT kTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
@@ -92,6 +93,8 @@ struct AppState {
   HWND save{};
   HWND close{};
   HWND settings_button{};
+  HWND repository_link{};
+  HWND attribution{};
   config_theme::Theme theme;
   RECT device_card{};
   RECT settings_card{};
@@ -143,6 +146,8 @@ void show_settings(AppState& app, bool show) {
        app.recommendation}) ShowWindow(control, show ? SW_HIDE : SW_SHOW);
   ShowWindow(app.device_list, !show && !app.channels.empty() ? SW_SHOW : SW_HIDE);
   ShowWindow(app.status_log, show ? SW_SHOW : SW_HIDE);
+  ShowWindow(app.repository_link, show ? SW_SHOW : SW_HIDE);
+  ShowWindow(app.attribution, show ? SW_SHOW : SW_HIDE);
   SetWindowTextW(app.settings_button, show ? L"返回设备" : L"Settings");
   RECT client{};
   GetClientRect(app.window, &client);
@@ -936,6 +941,10 @@ void create_controls(AppState& app) {
                         ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
                         16, 585, 1070, 190, kStatusLog);
   app.theme.style_scrollbars(app.status_log);
+  app.repository_link = make(0, WC_LINK, L"<a href=\"https://github.com/wanan522z/AggregateAudio-asio\">GitHub 仓库 · AggregateAudio-asio</a>",
+      WS_CHILD | WS_TABSTOP, 0, 0, 1, 1, kRepository);
+  app.attribution = make(0, L"STATIC", L"powered by WanAn522z",
+      WS_CHILD | SS_LEFT | SS_CENTERIMAGE, 0, 0, 1, 1, 0);
   app.close = make(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                    992, 790, 100, 30, kClose);
   app.settings_button = make(0, L"BUTTON", L"Settings", WS_CHILD | WS_VISIBLE |
@@ -956,7 +965,7 @@ void apply_control_fonts(AppState& app) {
   }, reinterpret_cast<LPARAM>(&app.theme));
   for (const auto label : {app.sample_rate_label, app.asio_buffer_label,
                            app.device_buffer_label, app.active_device_label,
-                           app.recommendation, app.status_log}) {
+                           app.recommendation, app.status_log, app.repository_link, app.attribution}) {
     SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(app.theme.small_font), TRUE);
   }
   for (const auto combo : {app.sample_rate, app.asio_buffer, app.device_buffer}) {
@@ -1014,7 +1023,11 @@ void layout_controls(AppState& app, int width, int height) {
   MoveWindow(app.recommendation, margin + px(24), recommendation_y,
              content_width - px(24), px(34), TRUE);
   MoveWindow(app.status_log, app.log_card.left + px(14), app.log_card.top + px(34),
-             content_width - px(28), std::max(1L, app.log_card.bottom - app.log_card.top - px(44)), TRUE);
+             content_width - px(28), std::max(1L, app.log_card.bottom - app.log_card.top - px(100)), TRUE);
+  MoveWindow(app.repository_link, app.log_card.left + px(14), app.log_card.bottom - px(60),
+             content_width - px(28), px(24), TRUE);
+  MoveWindow(app.attribution, app.log_card.left + px(14), app.log_card.bottom - px(34),
+             content_width - px(28), px(22), TRUE);
   MoveWindow(app.close, width - margin - px(80), actions_y, px(80), px(32), TRUE);
   InvalidateRect(app.window, nullptr, FALSE);
 }
@@ -1146,7 +1159,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       const auto control = reinterpret_cast<HWND>(lparam);
       SetBkMode(dc, TRANSPARENT);
       SetTextColor(dc, control == app->active_device ? config_theme::kInk : config_theme::kMuted);
-      if (control == app->status_log) {
+      if (control == app->status_log || control == app->repository_link || control == app->attribution) {
         SetBkColor(dc, config_theme::kLog);
         return reinterpret_cast<LRESULT>(app->theme.log);
       }
@@ -1243,6 +1256,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     }
     case WM_NOTIFY: {
       const auto* header = reinterpret_cast<const NMHDR*>(lparam);
+      if (header->idFrom == kRepository && (header->code == NM_CLICK || header->code == NM_RETURN)) {
+        const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open",
+            L"https://github.com/wanan522z/AggregateAudio-asio", nullptr, nullptr, SW_SHOWNORMAL));
+        if (result <= 32) MessageBoxW(window, L"无法打开浏览器，请手动访问 GitHub 仓库。",
+            L"Aggregate Audio", MB_OK | MB_ICONINFORMATION);
+        return 0;
+      }
       if (header->idFrom == kDeviceList && header->code == NM_CUSTOMDRAW) {
         return config_theme::draw_list(app->theme, *reinterpret_cast<NMLVCUSTOMDRAW*>(lparam));
       }
@@ -1386,7 +1406,7 @@ int run_config_ui(HINSTANCE instance, int show_command) {
     ULONG_PTR token;
     ~GraphicsLifetime() { Gdiplus::GdiplusShutdown(token); }
   } graphics_lifetime{graphics_token};
-  INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+  INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_LINK_CLASS};
   InitCommonControlsEx(&controls);
 
   WNDCLASSEXW window_class{};
