@@ -58,6 +58,11 @@ channel, collapsed groups and the visible channel's position by stable
 IDs, including when enumeration order changes. A removed channel falls back
 to its surviving device.
 
+The list's horizontal and vertical scrollbars and the Settings log share a
+light track, rounded thumb, and subtle chevrons. Native scroll ranges, wheel
+and keyboard navigation remain available; pointer capture ends on release,
+cancellation, or a page switch. Thumb dragging preserves channel selections.
+
 The executable embeds the same five-bar brand as the window header, with icon
 sizes from 16 to 256 pixels. Starting ASIO launches the configurator in tray
 mode without showing a window. One notification icon covers all running hosts
@@ -78,6 +83,8 @@ from Settings or closes the device page. `config_ui_test` checks the native
 layout at 100%, 150%, and 200% scaling, scrolled-row drawing boundaries, log and
 selection persistence and concurrent process activation using hidden fixtures
 without opening audio devices or saving a profile.
+It also checks scrollbar dragging to both ends, track/arrow navigation, capture
+release, and unchanged log text and selection at each DPI.
 
 KS stream factories merge only when their topology reaches the same single
 physical connector, direction, and channel layout. Alternate factories remain

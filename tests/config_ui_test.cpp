@@ -213,7 +213,7 @@ bool render_preview(AppState& app, const wchar_t* path) {
     const int saved = SaveDC(context.dc);
     SetViewportOrgEx(context.dc, rect.left, rect.top, nullptr);
     IntersectClipRect(context.dc, 0, 0, rect.right - rect.left, rect.bottom - rect.top);
-    SendMessageW(child, WM_PRINT, reinterpret_cast<WPARAM>(context.dc), PRF_CLIENT | PRF_CHILDREN);
+    SendMessageW(child, WM_PRINT, reinterpret_cast<WPARAM>(context.dc), PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN);
     RestoreDC(context.dc, saved);
     return TRUE;
   }, reinterpret_cast<LPARAM>(&render));
@@ -237,6 +237,60 @@ bool render_preview(AppState& app, const wchar_t* path) {
   DeleteDC(dc);
   ReleaseDC(nullptr, screen);
   return saved;
+}
+
+bool scrollbar_drag(HWND control, int bar, bool to_end, bool cancel = false) {
+  SCROLLBARINFO info{sizeof(info)};
+  SCROLLINFO before{sizeof(before), SIF_ALL};
+  if (!GetScrollBarInfo(control, bar == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &info) ||
+      !GetScrollInfo(control, bar, &before) || info.xyThumbBottom <= info.xyThumbTop) return false;
+  const int axis = (info.xyThumbTop + info.xyThumbBottom) / 2;
+  POINT thumb = bar == SB_VERT ? POINT{(info.rcScrollBar.left + info.rcScrollBar.right) / 2,
+      info.rcScrollBar.top + axis} : POINT{info.rcScrollBar.left + axis,
+      (info.rcScrollBar.top + info.rcScrollBar.bottom) / 2};
+  SendMessageW(control, WM_NCLBUTTONDOWN, bar == SB_VERT ? HTVSCROLL : HTHSCROLL,
+      MAKELPARAM(thumb.x, thumb.y));
+  bool captured = GetCapture() == control;
+  if (bar == SB_VERT) thumb.y = to_end ? info.rcScrollBar.bottom + 40 : info.rcScrollBar.top - 40;
+  else thumb.x = to_end ? info.rcScrollBar.right + 40 : info.rcScrollBar.left - 40;
+  ScreenToClient(control, &thumb);
+  SendMessageW(control, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(thumb.x, thumb.y));
+  SendMessageW(control, cancel ? WM_CANCELMODE : WM_LBUTTONUP, 0, MAKELPARAM(thumb.x, thumb.y));
+  SCROLLINFO after{sizeof(after), SIF_ALL};
+  GetScrollInfo(control, bar, &after);
+  const int maximum = after.nMax - static_cast<int>(std::max(1u, after.nPage)) + 1;
+  // ListView rounds vertical movement to rows. Both extremes must remain within
+  // one row, and pointer capture must be released on up/cancel.
+  const bool moved = to_end ? after.nPos > before.nPos && maximum - after.nPos < 64 :
+      after.nPos < before.nPos && after.nPos == after.nMin;
+  if (!moved) std::printf("Scroll drag %d %d: before=%d after=%d max=%d\n", bar, to_end,
+      before.nPos, after.nPos, maximum);
+  return captured && moved && GetCapture() != control;
+}
+
+bool scrollbar_page_and_arrow(HWND control, int bar) {
+  SCROLLBARINFO info{sizeof(info)};
+  SCROLLINFO before{sizeof(before), SIF_POS};
+  GetScrollInfo(control, bar, &before);
+  if (!GetScrollBarInfo(control, bar == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &info)) return false;
+  POINT point = bar == SB_VERT ? POINT{(info.rcScrollBar.left + info.rcScrollBar.right) / 2,
+      info.rcScrollBar.top + (info.xyThumbBottom + info.rcScrollBar.bottom - info.rcScrollBar.top - info.dxyLineButton) / 2} :
+      POINT{info.rcScrollBar.left + (info.xyThumbBottom + info.rcScrollBar.right - info.rcScrollBar.left - info.dxyLineButton) / 2,
+      (info.rcScrollBar.top + info.rcScrollBar.bottom) / 2};
+  SendMessageW(control, WM_NCLBUTTONDOWN, bar == SB_VERT ? HTVSCROLL : HTHSCROLL,
+      MAKELPARAM(point.x, point.y));
+  SendMessageW(control, WM_LBUTTONUP, 0, 0);
+  SCROLLINFO page{sizeof(page), SIF_POS};
+  GetScrollInfo(control, bar, &page);
+  GetScrollBarInfo(control, bar == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &info);
+  if (bar == SB_VERT) point.y = info.rcScrollBar.top + info.dxyLineButton / 2;
+  else point.x = info.rcScrollBar.left + info.dxyLineButton / 2;
+  SendMessageW(control, WM_NCLBUTTONDOWN, bar == SB_VERT ? HTVSCROLL : HTHSCROLL,
+      MAKELPARAM(point.x, point.y));
+  SendMessageW(control, WM_LBUTTONUP, 0, 0);
+  SCROLLINFO arrow{sizeof(arrow), SIF_POS};
+  GetScrollInfo(control, bar, &arrow);
+  return page.nPos > before.nPos && arrow.nPos < page.nPos && GetCapture() != control;
 }
 
 } // namespace
@@ -368,6 +422,56 @@ int wmain(int argc, wchar_t** argv) {
     app.populating = true;
     populate_device_list(app, app.saved_settings);
     app.populating = false;
+    for (const UINT dpi : {96u, 144u, 192u}) {
+      RECT suggested{0, 0, MulDiv(980, dpi, 96), MulDiv(660, dpi, 96)};
+      SendMessageW(window, WM_DPICHANGED, MAKELONG(dpi, dpi), reinterpret_cast<LPARAM>(&suggested));
+      SendMessageW(app.device_list, WM_VSCROLL, SB_TOP, 0);
+      const auto checked_before = checked_channel_indices(app);
+      const auto selected_before = ListView_GetNextItem(app.device_list, -1, LVNI_SELECTED);
+      check(scrollbar_drag(app.device_list, SB_VERT, true) &&
+          scrollbar_drag(app.device_list, SB_VERT, false, true),
+          "Themed vertical thumb reaches both ends and releases capture at all DPIs");
+      check(scrollbar_page_and_arrow(app.device_list, SB_VERT), "Themed list track and arrow navigate natively");
+      SendMessageW(app.device_list, WM_VSCROLL, SB_TOP, 0);
+      SendMessageW(app.device_list, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+      check(GetScrollPos(app.device_list, SB_VERT) > 0, "List wheel navigation remains native");
+      SendMessageW(app.device_list, WM_VSCROLL, SB_TOP, 0);
+      ListView_SetColumnWidth(app.device_list, 0, app.theme.px(1800));
+      check(scrollbar_drag(app.device_list, SB_HORZ, true) && scrollbar_drag(app.device_list, SB_HORZ, false),
+          "Themed horizontal thumb reaches both ends at all DPIs");
+      check(scrollbar_page_and_arrow(app.device_list, SB_HORZ), "Themed horizontal track and arrow navigate natively");
+      SendMessageW(app.device_list, WM_HSCROLL, SB_LEFT, 0);
+      if (argc > 1) {
+        const auto path = std::wstring(argv[1]) + L".scrollbars." + std::to_wstring(dpi) + L"dpi.png";
+        check(render_preview(app, path.c_str()), "Both themed list scrollbars preview");
+      }
+      resize_columns(app.device_list, app.theme);
+      check(checked_before == checked_channel_indices(app) &&
+          selected_before == ListView_GetNextItem(app.device_list, -1, LVNI_SELECTED),
+          "Scrollbar navigation preserves channel selection and routing");
+      SendMessageW(window, WM_COMMAND, kSettings, 0);
+      std::wstring lines;
+      for (int line = 0; line < 300; ++line) lines += L"运行日志 scrollbar fixture " + std::to_wstring(line) + L"\r\n";
+      SetWindowTextW(app.status_log, lines.c_str());
+      SendMessageW(app.status_log, EM_SETSEL, 0, 0);
+      SendMessageW(app.status_log, WM_VSCROLL, SB_TOP, 0);
+      check(scrollbar_drag(app.status_log, SB_VERT, true) && scrollbar_drag(app.status_log, SB_VERT, false),
+          "Themed log thumb scrolls the read-only text at all DPIs");
+      check(scrollbar_page_and_arrow(app.status_log, SB_VERT), "Themed log track and arrow navigate natively");
+      DWORD first{}, last{};
+      SendMessageW(app.status_log, EM_GETSEL, reinterpret_cast<WPARAM>(&first), reinterpret_cast<LPARAM>(&last));
+      check(GetWindowTextLengthW(app.status_log) == static_cast<int>(lines.size()) && first == 0 && last == 0,
+          "Log scrollbar leaves text and caret selection intact");
+      SendMessageW(app.status_log, WM_VSCROLL, SB_TOP, 0);
+      SendMessageW(app.status_log, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+      check(GetScrollPos(app.status_log, SB_VERT) > 0, "Log wheel navigation remains native");
+      if (argc > 1 && dpi == 144) {
+        const auto path = std::wstring(argv[1]) + L".log-scrollbar.png";
+        check(render_preview(app, path.c_str()), "Themed log scrollbar preview");
+      }
+      SendMessageW(window, WM_COMMAND, kSettings, 0);
+    }
+    SendMessageW(window, WM_DPICHANGED, MAKELONG(96, 96), reinterpret_cast<LPARAM>(&normal));
     ListView_EnsureVisible(app.device_list, 27, FALSE);
     ListView_Scroll(app.device_list, 0, app.theme.px(13));
     check(item_drawing_is_clipped(app), "Scrolled channel rows cannot paint over column headers and preserve DC clip");

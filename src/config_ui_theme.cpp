@@ -3,9 +3,11 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <uxtheme.h>
+#include <windowsx.h>
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -142,6 +144,250 @@ LRESULT CALLBACK header_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
   return result;
 }
 
+// Keep the controls' real nonclient scrollbar geometry and scroll ranges. Only
+// the face and pointer tracking are themed; wheel/keyboard/accessibility still
+// use the native ListView and EDIT controls.
+enum class ScrollPart { none, previous, next, page_previous, page_next, thumb };
+struct ScrollSkin {
+  Theme* theme{};
+  bool list{};
+  bool redraw{true};
+  int hot_bar{-1};
+  ScrollPart hot{ScrollPart::none};
+  int active_bar{-1};
+  ScrollPart pressed{ScrollPart::none};
+  int drag_offset{};
+  POINT pointer{}; // Screen coordinates, also used by held arrow/page buttons.
+};
+constexpr UINT_PTR kScrollTimer = 0xAA53;
+
+struct ScrollGeometry {
+  RECT bar{}; // Window coordinates, suitable for GetWindowDC / WM_PRINT.
+  SCROLLINFO range{sizeof(SCROLLINFO), SIF_ALL};
+  int start{}, end{}, track_start{}, track_end{}, thumb_start{}, thumb_end{};
+  int maximum{};
+  bool enabled{};
+};
+
+bool scroll_geometry(HWND window, int bar, ScrollGeometry& geometry) {
+  const auto style = GetWindowLongPtrW(window, GWL_STYLE);
+  if (!(style & (bar == SB_VERT ? WS_VSCROLL : WS_HSCROLL))) return false;
+  SCROLLBARINFO info{sizeof(info)};
+  if (!GetScrollBarInfo(window, bar == SB_VERT ? OBJID_VSCROLL : OBJID_HSCROLL, &info) ||
+      !GetScrollInfo(window, bar, &geometry.range)) return false;
+  RECT bounds{};
+  GetWindowRect(window, &bounds);
+  geometry.bar = info.rcScrollBar;
+  OffsetRect(&geometry.bar, -bounds.left, -bounds.top);
+  geometry.start = bar == SB_VERT ? geometry.bar.top : geometry.bar.left;
+  geometry.end = bar == SB_VERT ? geometry.bar.bottom : geometry.bar.right;
+  geometry.track_start = geometry.start + info.dxyLineButton;
+  geometry.track_end = geometry.end - info.dxyLineButton;
+  geometry.thumb_start = geometry.start + info.xyThumbTop;
+  geometry.thumb_end = geometry.start + info.xyThumbBottom;
+  geometry.maximum = std::max(geometry.range.nMin,
+      geometry.range.nMax - static_cast<int>(std::max(1u, geometry.range.nPage)) + 1);
+  geometry.enabled = IsWindowEnabled(window) && geometry.maximum > geometry.range.nMin &&
+      !(info.rgstate[0] & STATE_SYSTEM_UNAVAILABLE);
+  return geometry.end > geometry.start;
+}
+
+ScrollPart scroll_hit(HWND window, int bar, POINT screen) {
+  ScrollGeometry geometry;
+  if (!scroll_geometry(window, bar, geometry) || !geometry.enabled) return ScrollPart::none;
+  RECT bounds{};
+  GetWindowRect(window, &bounds);
+  POINT point{screen.x - bounds.left, screen.y - bounds.top};
+  if (!PtInRect(&geometry.bar, point)) return ScrollPart::none;
+  const int axis = bar == SB_VERT ? point.y : point.x;
+  if (axis < geometry.track_start) return ScrollPart::previous;
+  if (axis >= geometry.track_end) return ScrollPart::next;
+  if (axis < geometry.thumb_start) return ScrollPart::page_previous;
+  if (axis >= geometry.thumb_end) return ScrollPart::page_next;
+  return ScrollPart::thumb;
+}
+
+void draw_scrollbars(HWND window, HDC dc, const ScrollSkin& skin) {
+  for (const int bar : {SB_VERT, SB_HORZ}) {
+    ScrollGeometry geometry;
+    if (!scroll_geometry(window, bar, geometry)) continue;
+    fill(dc, geometry.bar, kLog);
+    if (geometry.enabled && geometry.thumb_end > geometry.thumb_start) {
+      auto thumb = geometry.bar;
+      const int thickness = bar == SB_VERT ? thumb.right - thumb.left : thumb.bottom - thumb.top;
+      const int inset = std::max(2, (thickness - skin.theme->px(7)) / 2);
+      if (bar == SB_VERT) {
+        thumb.top = geometry.thumb_start + 1;
+        thumb.bottom = geometry.thumb_end - 1;
+        InflateRect(&thumb, -inset, 0);
+      } else {
+        thumb.left = geometry.thumb_start + 1;
+        thumb.right = geometry.thumb_end - 1;
+        InflateRect(&thumb, 0, -inset);
+      }
+      const auto shade = skin.active_bar == bar && skin.pressed == ScrollPart::thumb ? kAccent :
+          skin.hot_bar == bar && skin.hot == ScrollPart::thumb ? RGB(148, 154, 145) : RGB(197, 201, 191);
+      rounded_rect(dc, thumb, skin.theme->px(5), shade);
+    }
+    // Small chevrons retain the native arrow targets without square buttons.
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    for (const auto part : {ScrollPart::previous, ScrollPart::next}) {
+      const auto shade = !geometry.enabled ? kBorder :
+          skin.active_bar == bar && skin.pressed == part ? kAccent : kMuted;
+      Gdiplus::Pen pen(color(shade), 1.3f * static_cast<float>(skin.theme->dpi) / 96.0f);
+      pen.SetStartCap(Gdiplus::LineCapRound);
+      pen.SetEndCap(Gdiplus::LineCapRound);
+      const float axis = part == ScrollPart::previous ?
+          (geometry.start + geometry.track_start) / 2.0f : (geometry.track_end + geometry.end) / 2.0f;
+      const float cross = bar == SB_VERT ? (geometry.bar.left + geometry.bar.right) / 2.0f :
+          (geometry.bar.top + geometry.bar.bottom) / 2.0f;
+      const float size = std::min(3.0f * skin.theme->dpi / 96.0f,
+          (geometry.track_start - geometry.start) / 4.0f);
+      const float direction = part == ScrollPart::previous ? -1.0f : 1.0f;
+      if (bar == SB_VERT) {
+        graphics.DrawLine(&pen, cross - size, axis - direction * size / 2, cross, axis + direction * size / 2);
+        graphics.DrawLine(&pen, cross, axis + direction * size / 2, cross + size, axis - direction * size / 2);
+      } else {
+        graphics.DrawLine(&pen, axis - direction * size / 2, cross - size, axis + direction * size / 2, cross);
+        graphics.DrawLine(&pen, axis + direction * size / 2, cross, axis - direction * size / 2, cross + size);
+      }
+    }
+  }
+  ScrollGeometry vertical, horizontal;
+  if (scroll_geometry(window, SB_VERT, vertical) && scroll_geometry(window, SB_HORZ, horizontal))
+    fill(dc, {vertical.bar.left, horizontal.bar.top, vertical.bar.right, horizontal.bar.bottom}, kLog);
+}
+
+void repaint_scrollbars(HWND window, const ScrollSkin& skin) {
+  if (!skin.redraw || !(GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE)) return;
+  const auto dc = GetWindowDC(window);
+  if (dc) { draw_scrollbars(window, dc, skin); ReleaseDC(window, dc); }
+}
+
+void scroll_step(HWND window, const ScrollSkin& skin) {
+  const int command = skin.pressed == ScrollPart::previous ? SB_LINEUP :
+      skin.pressed == ScrollPart::next ? SB_LINEDOWN :
+      skin.pressed == ScrollPart::page_previous ? SB_PAGEUP : SB_PAGEDOWN;
+  SendMessageW(window, skin.active_bar == SB_VERT ? WM_VSCROLL : WM_HSCROLL, command, 0);
+}
+
+void drag_scrollbar(HWND window, const ScrollSkin& skin) {
+  ScrollGeometry geometry;
+  if (!scroll_geometry(window, skin.active_bar, geometry) || !geometry.enabled) return;
+  RECT bounds{};
+  GetWindowRect(window, &bounds);
+  const int axis = skin.active_bar == SB_VERT ? skin.pointer.y - bounds.top : skin.pointer.x - bounds.left;
+  const int travel = geometry.track_end - geometry.track_start - (geometry.thumb_end - geometry.thumb_start);
+  if (travel <= 0) return;
+  const int position = geometry.range.nMin + MulDiv(
+      std::clamp(axis - skin.drag_offset - geometry.track_start, 0, travel),
+      geometry.maximum - geometry.range.nMin, travel);
+  const int delta = position - geometry.range.nPos;
+  if (!delta) return;
+  if (skin.list && (skin.active_bar == SB_HORZ || ListView_IsGroupViewEnabled(window))) {
+    // Grouped report views expose pixel ranges; LVM_SCROLL avoids the 16-bit
+    // WM_*SCROLL thumb-position limit and leaves selection/collapse untouched.
+    ListView_Scroll(window, skin.active_bar == SB_HORZ ? delta : 0,
+        skin.active_bar == SB_VERT ? delta : 0);
+  } else if (!skin.list) {
+    SendMessageW(window, EM_LINESCROLL, skin.active_bar == SB_HORZ ? delta : 0,
+        skin.active_bar == SB_VERT ? delta : 0);
+  } else {
+    SendMessageW(window, skin.active_bar == SB_VERT ? WM_VSCROLL : WM_HSCROLL,
+        MAKEWPARAM(SB_THUMBPOSITION, position), 0);
+  }
+}
+
+LRESULT CALLBACK scroll_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                            UINT_PTR id, DWORD_PTR data) {
+  auto& skin = *reinterpret_cast<ScrollSkin*>(data);
+  if (message == WM_NCDESTROY) {
+    KillTimer(window, kScrollTimer);
+    RemoveWindowSubclass(window, scroll_proc, id);
+    delete &skin;
+    return DefSubclassProc(window, message, wparam, lparam);
+  }
+  if (message == WM_SETREDRAW) skin.redraw = wparam != 0;
+  if (message == WM_SETCURSOR && (LOWORD(lparam) == HTVSCROLL || LOWORD(lparam) == HTHSCROLL)) {
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    return TRUE;
+  }
+  if (message == WM_NCMOUSEMOVE) {
+    skin.pointer = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    skin.hot_bar = wparam == HTVSCROLL ? SB_VERT : wparam == HTHSCROLL ? SB_HORZ : -1;
+    skin.hot = skin.hot_bar < 0 ? ScrollPart::none : scroll_hit(window, skin.hot_bar, skin.pointer);
+    TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE | TME_NONCLIENT, window, 0};
+    TrackMouseEvent(&track);
+    repaint_scrollbars(window, skin);
+  }
+  if (message == WM_NCMOUSELEAVE) {
+    skin.hot_bar = -1;
+    skin.hot = ScrollPart::none;
+    repaint_scrollbars(window, skin);
+  }
+  if ((message == WM_NCLBUTTONDOWN || message == WM_NCLBUTTONDBLCLK) &&
+      (wparam == HTVSCROLL || wparam == HTHSCROLL)) {
+    skin.pointer = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    skin.active_bar = wparam == HTVSCROLL ? SB_VERT : SB_HORZ;
+    skin.pressed = scroll_hit(window, skin.active_bar, skin.pointer);
+    if (skin.pressed == ScrollPart::none) { skin.active_bar = -1; return 0; }
+    SetFocus(window);
+    SetCapture(window);
+    if (skin.pressed == ScrollPart::thumb) {
+      ScrollGeometry geometry;
+      RECT bounds{};
+      GetWindowRect(window, &bounds);
+      scroll_geometry(window, skin.active_bar, geometry);
+      skin.drag_offset = (skin.active_bar == SB_VERT ? skin.pointer.y - bounds.top :
+          skin.pointer.x - bounds.left) - geometry.thumb_start;
+    } else {
+      scroll_step(window, skin);
+      SetTimer(window, kScrollTimer, 400, nullptr);
+    }
+    repaint_scrollbars(window, skin);
+    return 0;
+  }
+  if (message == WM_MOUSEMOVE && skin.active_bar >= 0) {
+    skin.pointer = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    ClientToScreen(window, &skin.pointer);
+    if (skin.pressed == ScrollPart::thumb) drag_scrollbar(window, skin);
+    repaint_scrollbars(window, skin);
+    return 0;
+  }
+  if (message == WM_TIMER && wparam == kScrollTimer && skin.active_bar >= 0) {
+    if (skin.pressed != ScrollPart::thumb &&
+        scroll_hit(window, skin.active_bar, skin.pointer) == skin.pressed) scroll_step(window, skin);
+    SetTimer(window, kScrollTimer, 60, nullptr);
+    repaint_scrollbars(window, skin);
+    return 0;
+  }
+  if (skin.active_bar >= 0 && (message == WM_LBUTTONUP || message == WM_CANCELMODE ||
+      message == WM_CAPTURECHANGED || (message == WM_SHOWWINDOW && !wparam) ||
+      (message == WM_ENABLE && !wparam))) {
+    const int bar = skin.active_bar;
+    skin.active_bar = -1;
+    skin.pressed = ScrollPart::none;
+    KillTimer(window, kScrollTimer);
+    if (GetCapture() == window) ReleaseCapture();
+    SendMessageW(window, bar == SB_VERT ? WM_VSCROLL : WM_HSCROLL, SB_ENDSCROLL, 0);
+    repaint_scrollbars(window, skin);
+    if (message == WM_LBUTTONUP) return 0;
+  }
+  const auto result = DefSubclassProc(window, message, wparam, lparam);
+  if (message == WM_PRINT && (lparam & PRF_NONCLIENT)) {
+    draw_scrollbars(window, reinterpret_cast<HDC>(wparam), skin);
+  } else if (message == WM_NCPAINT || message == WM_PAINT || message == WM_SIZE ||
+      message == WM_NCMOUSEMOVE || message == WM_NCMOUSELEAVE ||
+      message == WM_VSCROLL || message == WM_HSCROLL || message == WM_MOUSEWHEEL ||
+      message == WM_MOUSEHWHEEL || message == WM_SETFONT || message == WM_ENABLE ||
+      message == WM_SETTEXT || message == EM_REPLACESEL || message == EM_LINESCROLL ||
+      message == EM_SCROLLCARET || message == LVM_SCROLL || (message == WM_SETREDRAW && wparam)) {
+    repaint_scrollbars(window, skin);
+  }
+  return result;
+}
+
 LRESULT CALLBACK list_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                           UINT_PTR, DWORD_PTR data) {
   const auto& theme = *reinterpret_cast<Theme*>(data);
@@ -221,7 +467,20 @@ void Theme::style_list(HWND list) {
   SetWindowTheme(header, L"", L"");
   SetWindowSubclass(header, header_proc, 1, reinterpret_cast<DWORD_PTR>(this));
   SetWindowSubclass(list, list_proc, 1, reinterpret_cast<DWORD_PTR>(this));
+  style_scrollbars(list);
   update_list_images(list);
+}
+
+void Theme::style_scrollbars(HWND control) {
+  DWORD_PTR existing{};
+  if (GetWindowSubclass(control, scroll_proc, 3, &existing)) return;
+  SetWindowTheme(control, L"", L"");
+  auto skin = std::make_unique<ScrollSkin>();
+  skin->theme = this;
+  std::array<wchar_t, 64> klass{};
+  GetClassNameW(control, klass.data(), static_cast<int>(klass.size()));
+  skin->list = std::wcscmp(klass.data(), WC_LISTVIEWW) == 0;
+  if (SetWindowSubclass(control, scroll_proc, 3, reinterpret_cast<DWORD_PTR>(skin.get()))) skin.release();
 }
 
 void Theme::update_list_images(HWND list) {

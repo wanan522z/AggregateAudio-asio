@@ -935,6 +935,7 @@ void create_controls(AppState& app) {
   app.status_log = make(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP |
                         ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
                         16, 585, 1070, 190, kStatusLog);
+  app.theme.style_scrollbars(app.status_log);
   app.close = make(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                    992, 790, 100, 30, kClose);
   app.settings_button = make(0, L"BUTTON", L"Settings", WS_CHILD | WS_VISIBLE |

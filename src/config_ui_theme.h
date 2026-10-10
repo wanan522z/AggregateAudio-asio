@@ -39,6 +39,7 @@ struct Theme {
   void style_button(HWND button);
   void style_combo(HWND combo);
   void style_list(HWND list);
+  void style_scrollbars(HWND control);
   void update_list_images(HWND list);
 };
 
