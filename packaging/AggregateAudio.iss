@@ -5,7 +5,7 @@
   #error Supply OutputDir.
 #endif
 #ifndef ReleaseNumber
-  #define ReleaseNumber 15
+  #define ReleaseNumber 16
 #endif
 #define DriverClsid "{D3AA79B2-9D91-4B6F-A2B1-55CE84C2A43D}"
 #ifdef PackagingTest
@@ -90,8 +90,8 @@ Source: "{#PayloadDir}\binaries.sha256"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
 Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\ASIO\Aggregate Audio"; ValueType: string; ValueName: "CLSID"; ValueData: "{{#DriverClsid}"
-Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\ASIO\Aggregate Audio"; ValueType: string; ValueName: "Description"; ValueData: "Multi-device audio driver for ASIO hosts"
-Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\Classes\CLSID\{{#DriverClsid}"; ValueType: string; ValueName: ""; ValueData: "Multi-device audio driver for ASIO hosts"
+Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\ASIO\Aggregate Audio"; ValueType: string; ValueName: "Description"; ValueData: "Aggregate Audio"
+Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\Classes\CLSID\{{#DriverClsid}"; ValueType: string; ValueName: ""; ValueData: "Aggregate Audio"
 Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\Classes\CLSID\{{#DriverClsid}\InprocServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\AggregateAudio.dll"
 Root: {#RegistryRoot}; Subkey: "{#RegistryBase}SOFTWARE\Classes\CLSID\{{#DriverClsid}\InprocServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Apartment"
 

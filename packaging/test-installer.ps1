@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([ValidateRange(1, 65535)][int]$ReleaseNumber = 15, [string]$Compiler)
+param([ValidateRange(1, 65535)][int]$ReleaseNumber = 16, [string]$Compiler)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Compiler) { $Compiler = Join-Path $taskRoot 'build\packaging-tools\inno-7.1.0\tools\ISCC.exe' }
@@ -62,6 +62,8 @@ try {
         Assert-That ((Get-FileHash -LiteralPath (Join-Path $taskInstall $taskName)).Hash -eq $taskManifest[$taskName]) "Installed hash mismatch: $taskName"
     }
     Assert-That ((Read-FixtureValue $taskAsio 'CLSID') -eq $taskClsid) 'ASIO CLSID mismatch.'
+    Assert-That ((Read-FixtureValue $taskAsio 'Description') -eq 'Aggregate Audio') 'Host-visible ASIO name differs from the product name.'
+    Assert-That ((Read-FixtureValue $taskCom '') -eq 'Aggregate Audio') 'COM display name differs from the product name.'
     Assert-That ((Read-FixtureValue "$taskCom\InprocServer32" '') -eq (Join-Path $taskInstall 'AggregateAudio.dll')) 'COM path mismatch (Unicode path test).'
     Assert-That ((Read-FixtureValue "$taskCom\InprocServer32" 'ThreadingModel') -eq 'Apartment') 'COM threading mismatch.'
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $taskInstall 'vc_redist.x64.exe'))) 'Prerequisite left in application directory.'
@@ -76,7 +78,15 @@ try {
     } finally { $taskLockedFile.Dispose() }
     Write-Output 'PASS: upgrade and uninstall reject locked driver files without closing applications'
 
+    $taskLegacyAsio = $taskCurrentUser.OpenSubKey($taskAsio, $true)
+    $taskLegacyCom = $taskCurrentUser.OpenSubKey($taskCom, $true)
+    try {
+        $taskLegacyAsio.SetValue('Description', 'Multi-device audio driver for ASIO hosts')
+        $taskLegacyCom.SetValue('', 'Multi-device audio driver for ASIO hosts')
+    } finally { $taskLegacyAsio.Dispose(); $taskLegacyCom.Dispose() }
     Assert-That ((Invoke-Fixture $taskSetup 'update.log' -Installing) -eq 0) 'Unlocked update failed.'
+    Assert-That ((Read-FixtureValue $taskAsio 'Description') -eq 'Aggregate Audio') 'Upgrade kept the legacy ASIO display name.'
+    Assert-That ((Read-FixtureValue $taskCom '') -eq 'Aggregate Audio') 'Upgrade kept the legacy COM display name.'
     Assert-That ((Invoke-Fixture $taskUninstaller 'uninstall.log') -eq 0) 'Uninstall failed.'
     Assert-That ($null -eq (Read-FixtureValue $taskAsio 'CLSID')) 'ASIO registration survived uninstall.'
     Assert-That ($null -eq (Read-FixtureValue "$taskCom\InprocServer32" '')) 'COM registration survived uninstall.'

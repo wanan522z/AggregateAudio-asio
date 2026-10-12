@@ -89,6 +89,56 @@ bool layout_is_valid(const AppState& app) {
       settings.bottom < app.device_card.top && settings.right <= client.right;
 }
 
+struct LogPaintProbe {
+  HWND log{};
+  int hidden_paints{};
+  int visible_paints{};
+};
+
+LRESULT CALLBACK log_paint_probe(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                                 UINT_PTR, DWORD_PTR data) {
+  auto& probe = *reinterpret_cast<LogPaintProbe*>(data);
+  if ((message == WM_CTLCOLORSTATIC || message == WM_CTLCOLOREDIT) &&
+      reinterpret_cast<HWND>(lparam) == probe.log) {
+    if (GetWindowLongPtrW(probe.log, GWL_STYLE) & WS_VISIBLE) ++probe.visible_paints;
+    else ++probe.hidden_paints;
+  }
+  return DefSubclassProc(window, message, wparam, lparam);
+}
+
+bool background_log_does_not_paint(AppState& app) {
+  LogPaintProbe probe{app.status_log};
+  SetWindowSubclass(app.window, log_paint_probe, 77, reinterpret_cast<DWORD_PTR>(&probe));
+  RECT bounds{};
+  GetWindowRect(app.window, &bounds);
+  // Exercise native immediate drawing with a visible parent, beyond the desktop,
+  // without covering the user's windows or taking keyboard focus.
+  SetWindowPos(app.window, nullptr,
+      GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 50,
+      bounds.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+  ShowWindow(app.window, SW_SHOWNOACTIVATE);
+  UpdateWindow(app.window);
+  probe.hidden_paints = 0;
+  for (int line = 0; line < 80; ++line)
+    append_log(app, L"Background log regression " + std::to_wstring(line));
+  refresh_devices(app);
+  SetWindowPos(app.window, nullptr, 0, 0, bounds.right - bounds.left + 40,
+      bounds.bottom - bounds.top + 40, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+  apply_control_fonts(app);
+  show_settings(app, true);
+  append_log(app, L"Visible log regression");
+  UpdateWindow(app.status_log);
+  show_settings(app, false);
+  for (int line = 0; line < 80; ++line)
+    append_log(app, L"Returned-page log regression " + std::to_wstring(line));
+  const bool passed = probe.hidden_paints == 0 && probe.visible_paints > 0 &&
+      !(GetWindowLongPtrW(app.status_log, GWL_STYLE) & WS_VISIBLE);
+  if (!passed) std::printf("Log drawing: hidden=%d visible=%d\n", probe.hidden_paints, probe.visible_paints);
+  ShowWindow(app.window, SW_HIDE);
+  RemoveWindowSubclass(app.window, log_paint_probe, 77);
+  return passed;
+}
+
 bool item_drawing_is_clipped(AppState& app) {
   const auto list = app.device_list;
   RECT client{}, header{};
@@ -331,6 +381,16 @@ int wmain(int argc, wchar_t** argv) {
   RegisterClassW(&klass);
 
   bool passed = true;
+  {
+    AppState app;
+    app.tray_enabled = false;
+    const auto window = create_fixture_window(app, instance, L"Background log fixture");
+    if (!window) return 1;
+    const bool log_passed = background_log_does_not_paint(app);
+    std::printf("Background logs never draw on the device page: %s\n", log_passed ? "PASS" : "FAIL");
+    passed = passed && log_passed;
+    DestroyWindow(window);
+  }
   {
     AppState app;
     app.tray_enabled = false; // Hidden layout fixtures never modify the real system tray.

@@ -915,14 +915,26 @@ extern "C" HRESULT __stdcall DllRegisterServer() {
   const LONG result = RegisterAsioDriver(
       CLSID_AggregateASIO, const_cast<char*>("AggregateAudio.dll"),
       const_cast<char*>("Aggregate Audio"),
-      const_cast<char*>("Multi-device audio driver for ASIO hosts"),
+      const_cast<char*>("Aggregate Audio"),
       const_cast<char*>("Apartment"));
   if (result != 0) return E_FAIL;
+
+  // Hosts can display Description rather than the ASIO key name. The SDK
+  // helper also keeps an existing COM description when the DLL path matches;
+  // overwrite it so re-registering upgrades the name on existing installs.
+  constexpr wchar_t display_name[] = L"Aggregate Audio";
+  LONG status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO\\Aggregate Audio",
+      L"Description", REG_SZ, display_name, sizeof(display_name));
+  if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+  status = RegSetKeyValueW(HKEY_CLASSES_ROOT,
+      L"CLSID\\{D3AA79B2-9D91-4B6F-A2B1-55CE84C2A43D}", nullptr,
+      REG_SZ, display_name, sizeof(display_name));
+  if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
 
   // Steinberg's helper does not propagate registry write failures. Verify the
   // ASIO host discovery entry before reporting successful self-registration.
   HKEY asio_key{};
-  LONG status = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+  status = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                               L"SOFTWARE\\ASIO\\Aggregate Audio", 0,
                               KEY_QUERY_VALUE, &asio_key);
   if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
