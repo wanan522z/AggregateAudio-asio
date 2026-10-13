@@ -26,6 +26,39 @@ int main() {
   passed = passed && reloaded.output_channel_keys == settings.output_channel_keys &&
       read_value(path, L"VirtualCables", L"Count").empty() && read_value(path, L"VirtualCable0", L"Id").empty() &&
       GetPrivateProfileIntW(L"Unrelated", L"Preserved", 0, path.c_str()) == 42;
+
+  AudioEndpoint endpoint;
+  endpoint.id = L"hardware-out";
+  endpoint.device_instance_id = L"hardware";
+  endpoint.direction = Direction::output;
+  endpoint.channels = 2;
+  AudioSettings current;
+  current.output_channel_keys = {L"hardware-out:ch=0"};
+  current.device_buffers = {{L"hardware", 512}};
+  update_available_device_settings(settings, {endpoint}, current);
+  update_available_device_settings(settings, {endpoint}, current);
+  passed = passed && settings.input_device_ids == std::vector<std::wstring>{L"hardware-in"} &&
+      settings.input_channel_keys == std::vector<std::wstring>{L"hardware-in:ch=0"} &&
+      settings.output_channel_keys == current.output_channel_keys &&
+      device_buffer_frames(settings, L"hardware") == 512;
+  passed = save_profile(path, settings) && passed;
+  const auto offline_profile = load_profile(path);
+  passed = passed && offline_profile.input_device_ids == settings.input_device_ids &&
+      offline_profile.input_channel_keys == settings.input_channel_keys &&
+      offline_profile.output_channel_keys == settings.output_channel_keys &&
+      device_buffer_frames(offline_profile, L"hardware") == 512;
+  current.output_channel_keys.clear();
+  update_available_device_settings(settings, {endpoint}, current);
+  passed = passed && settings.output_device_ids.empty() && settings.output_channel_keys.empty();
+  std::printf("Offline selections survive updates and disk round trip; disabling clears active selections: %s\n",
+      passed ? "PASS" : "FAIL");
+
+  settings.output_device_ids = {L"old-out"};
+  settings.output_channel_keys = {L"old-out:ch=1"};
+  endpoint.legacy_ids = {L"old-out"};
+  update_available_device_settings(settings, {endpoint}, current);
+  passed = passed && settings.output_device_ids.empty() && settings.output_channel_keys.empty();
+  std::printf("Returning endpoint aliases cannot resurrect a disabled selection: %s\n", passed ? "PASS" : "FAIL");
   WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
   DeleteFileW(path.c_str());
   std::printf("Removed cable entries ignored and cleaned on save; hardware settings preserved: %s\n", passed ? "PASS" : "FAIL");

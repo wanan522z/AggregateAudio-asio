@@ -36,6 +36,20 @@ AudioSettings load_audio_settings();
 bool save_audio_settings(const AudioSettings& settings);
 std::wstring channel_selection_key(const std::wstring& endpoint_id, unsigned channel);
 
+inline bool endpoint_has_channel_selection(const AudioSettings& settings,
+                                           const std::wstring& endpoint_id, Direction direction) {
+  const auto& keys = direction == Direction::input
+      ? settings.input_channel_keys : settings.output_channel_keys;
+  const auto prefix = endpoint_id + L":ch=";
+  return std::any_of(keys.begin(), keys.end(), [&](const auto& key) { return key.starts_with(prefix); });
+}
+
+// Replace only the choices represented by the current catalog. Disconnected
+// endpoints and temporarily unavailable channels retain their previous state.
+void update_available_device_settings(AudioSettings& settings,
+                                      const std::vector<AudioEndpoint>& catalog,
+                                      const AudioSettings& current);
+
 // Migrate only the in-memory profile. Saving remains an explicit UI action.
 inline void canonicalize_endpoint_selections(AudioSettings& settings,
                                              const std::vector<AudioEndpoint>& catalog) {

@@ -199,6 +199,34 @@ std::wstring channel_selection_key(const std::wstring& endpoint_id, unsigned cha
   return endpoint_id + L":ch=" + std::to_wstring(channel);
 }
 
+void update_available_device_settings(AudioSettings& settings,
+                                      const std::vector<AudioEndpoint>& catalog,
+                                      const AudioSettings& current) {
+  canonicalize_endpoint_selections(settings, catalog);
+  for (const auto& endpoint : catalog) {
+    auto& ids = endpoint.direction == Direction::input
+        ? settings.input_device_ids : settings.output_device_ids;
+    auto& keys = endpoint.direction == Direction::input
+        ? settings.input_channel_keys : settings.output_channel_keys;
+    const auto& current_keys = endpoint.direction == Direction::input
+        ? current.input_channel_keys : current.output_channel_keys;
+    for (unsigned channel = 0; channel < endpoint.channels; ++channel) {
+      const auto key = channel_selection_key(endpoint.id, channel);
+      std::erase(keys, key);
+      if (std::find(current_keys.begin(), current_keys.end(), key) != current_keys.end()) keys.push_back(key);
+    }
+    std::erase(ids, endpoint.id);
+    if (endpoint_has_channel_selection(settings, endpoint.id, endpoint.direction)) ids.push_back(endpoint.id);
+  }
+  for (const auto& buffer : current.device_buffers) {
+    const auto found = std::find_if(settings.device_buffers.begin(), settings.device_buffers.end(),
+        [&](const auto& previous) { return previous.device_id == buffer.device_id; });
+    if (found == settings.device_buffers.end()) settings.device_buffers.push_back(buffer);
+    else found->buffer_frames = buffer.buffer_frames;
+  }
+  settings.channel_selection_configured = true;
+}
+
 unsigned device_buffer_frames(const AudioSettings& settings, const std::wstring& device_id) {
   const auto found = std::find_if(settings.device_buffers.begin(), settings.device_buffers.end(),
       [&](const auto& item) { return item.device_id == device_id; });

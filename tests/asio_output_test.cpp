@@ -76,10 +76,11 @@ struct TestEngine {
 };
 }
 
-AudioSettings load_audio_settings() { AudioSettings settings; settings.initialized = true; return settings; }
+AudioSettings mock_settings;
+AudioSettings load_audio_settings() { auto settings = mock_settings; settings.initialized = true; return settings; }
 bool save_audio_settings(const AudioSettings&) { return true; }
 std::vector<AudioEndpoint> enumerate_endpoints() { return {}; }
-std::wstring channel_selection_key(const std::wstring& id, unsigned channel) { return id + std::to_wstring(channel); }
+std::wstring channel_selection_key(const std::wstring& id, unsigned channel) { return id + L":ch=" + std::to_wstring(channel); }
 
 #define AudioEngine TestEngine
 #define MessageBoxW fake_message_box
@@ -277,15 +278,30 @@ int main() {
   }
   passed = check_device_recovery() && passed;
   {
+    mock_settings.channel_selection_configured = true;
+    mock_settings.input_device_ids = mock_settings.output_device_ids = {L"test"};
+    mock_settings.output_channel_keys = {L"test:ch=1"};
+    HRESULT result = S_OK;
+    AggregateASIO driver(nullptr, &result);
+    long inputs{}, outputs{};
+    const bool initialized = driver.init(nullptr) != ASIOFalse;
+    const bool selected = initialized && driver.getChannels(&inputs, &outputs) == ASE_OK &&
+        inputs == 2 && outputs == 1;
+    passed = selected && passed;
+    std::printf("Reconnected legacy endpoint enables its channels while explicit channel choices stay selective: %s\n",
+        selected ? "PASS" : "FAIL");
+    mock_settings = {};
+  }
+  {
     mock_busy = true;
     HRESULT result = S_OK;
     AggregateASIO driver(nullptr, &result);
-    const bool rejected = driver.init(nullptr) == ASIOFalse && busy_dialogs == 1;
+    const bool rejected = driver.init(nullptr) == ASIOFalse && busy_dialogs == 0;
     char error[128]{};
     driver.getErrorMessage(error);
     const bool informed = std::string(error).find("Device is in use") != std::string::npos;
     passed = rejected && informed && passed;
-    std::printf("ASIO rejects occupation and shows release-and-retry popup: %s\n",
+    std::printf("ASIO returns occupation error without pumping a modal host message loop: %s\n",
         rejected && informed ? "PASS" : "FAIL");
     mock_busy = false;
   }

@@ -33,6 +33,10 @@ bool ui_fixture_first_profile = false;
 unsigned ui_fixture_capture_channels = 2;
 bool ui_fixture_reverse_catalog = false;
 bool ui_fixture_omit_capture = false;
+bool ui_fixture_omit_usb = false;
+bool ui_fixture_empty_catalog = false;
+bool ui_fixture_reload_profile = false;
+AudioSettings ui_fixture_saved_profile;
 std::wstring ui_fixture_busy_id, ui_fixture_dialog;
 unsigned ui_fixture_saves{}, ui_fixture_dialogs{}, ui_fixture_probes{};
 bool ui_fixture_probe_busy{};
@@ -45,7 +49,11 @@ int WINAPI ui_fixture_message_box(HWND, LPCWSTR text, LPCWSTR, UINT) {
   ++ui_fixture_dialogs;
   return IDOK;
 }
-bool ui_fixture_save_settings(const AudioSettings&) { ++ui_fixture_saves; return true; }
+bool ui_fixture_save_settings(const AudioSettings& settings) {
+  ui_fixture_saved_profile = settings;
+  ++ui_fixture_saves;
+  return true;
+}
 EndpointProbeResult ui_fixture_probe(const AudioEndpoint&, unsigned, unsigned frames, unsigned) {
   ++ui_fixture_probes;
   EndpointProbeResult result;
@@ -58,7 +66,9 @@ EndpointProbeResult ui_fixture_probe(const AudioEndpoint&, unsigned, unsigned fr
 
 std::vector<AudioEndpoint> ui_fixture_endpoints() {
   std::vector<AudioEndpoint> endpoints;
+  if (ui_fixture_empty_catalog) return endpoints;
   for (unsigned index = 0; index < 3; ++index) {
+    if (index < 2 && ui_fixture_omit_usb) continue;
     if (index == 0 && ui_fixture_omit_capture) continue;
     AudioEndpoint endpoint;
     endpoint.id = L"fixture-pin-" + std::to_wstring(index);
@@ -77,6 +87,7 @@ std::vector<AudioEndpoint> ui_fixture_endpoints() {
 }
 
 AudioSettings ui_fixture_settings() {
+  if (ui_fixture_reload_profile) return ui_fixture_saved_profile;
   if (ui_fixture_first_profile) return {};
   AudioSettings settings;
   settings.initialized = true;
@@ -423,6 +434,109 @@ int wmain(int argc, wchar_t** argv) {
   RegisterClassW(&klass);
 
   bool passed = true;
+  {
+    AppState app;
+    app.tray_enabled = false;
+    auto window = create_fixture_window(app, instance, L"Device reconnect fixture");
+    if (!window) return 1;
+    const auto check = [&](bool condition, const char* label) {
+      std::printf("%s: %s\n", label, condition ? "PASS" : "FAIL");
+      passed = passed && condition;
+    };
+    ListView_SetCheckState(app.device_list, 1, FALSE);
+    ListView_SetCheckState(app.device_list, 2, FALSE);
+    ListView_SetCheckState(app.device_list, 5, TRUE);
+    select_combo_value(app.device_buffer, 512);
+    SendMessageW(window, WM_COMMAND, MAKEWPARAM(kDeviceBuffer, CBN_SELCHANGE), 0);
+    const auto before = selection_from_current_ui(app);
+    ui_fixture_omit_usb = true;
+    SendMessageW(window, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0);
+    check(app.channels.size() == 6, "Plug notifications defer enumeration until the debounce timer");
+    SendMessageW(window, WM_TIMER, kDeviceRefreshTimer, 0);
+    check(app.channels.size() == 2 && checked_channel_indices(app).size() == 1,
+        "Unplug removes only the disconnected device from the visible list");
+    for (int refresh = 0; refresh < 3; ++refresh)
+      SendMessageW(window, config_tray::kDeviceRefreshMessage, 0, 0);
+    const auto saves_before = ui_fixture_saves;
+    save_profile(app);
+    check(ui_fixture_saves == saves_before + 1 &&
+        app.saved_settings.input_channel_keys == before.input_channel_keys &&
+        app.saved_settings.output_channel_keys == before.output_channel_keys &&
+        device_buffer_frames(app.saved_settings, L"fixture-usb") == 512,
+        "Repeated offline refresh and save retain individual switches and device buffers");
+    DestroyWindow(window);
+
+    // Reopen while USB is still absent, using the profile saved above.
+    ui_fixture_reload_profile = true;
+    AppState reopened;
+    reopened.tray_enabled = false;
+    window = create_fixture_window(reopened, instance, L"Saved offline reconnect fixture");
+    if (!window) return 1;
+    ui_fixture_empty_catalog = true;
+    for (int refresh = 0; refresh < 2; ++refresh) refresh_devices(reopened);
+    check(reopened.channels.empty() && !reopened.saved_settings.input_channel_keys.empty(),
+        "An entirely empty catalog preserves remembered selections");
+    ui_fixture_empty_catalog = ui_fixture_omit_usb = false;
+    SendMessageW(window, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0);
+    SendMessageW(window, WM_TIMER, kDeviceRefreshTimer, 0);
+    check(ListView_GetCheckState(reopened.device_list, 0) &&
+        !ListView_GetCheckState(reopened.device_list, 1) &&
+        !ListView_GetCheckState(reopened.device_list, 2) &&
+        ListView_GetCheckState(reopened.device_list, 3) &&
+        !ListView_GetCheckState(reopened.device_list, 4) &&
+        ListView_GetCheckState(reopened.device_list, 5) &&
+        device_buffer_frames(reopened.saved_settings, L"fixture-usb") == 512,
+        "Reconnect after reopening restores both enabled and disabled channels and KS buffer");
+    ListView_SetCheckState(reopened.device_list, 0, FALSE);
+    ListView_SetCheckState(reopened.device_list, 3, FALSE);
+    ui_fixture_omit_usb = true;
+    refresh_devices(reopened);
+    refresh_devices(reopened);
+    ui_fixture_omit_usb = false;
+    refresh_devices(reopened);
+    check(!ListView_GetCheckState(reopened.device_list, 0) &&
+        !ListView_GetCheckState(reopened.device_list, 1) &&
+        !ListView_GetCheckState(reopened.device_list, 2) &&
+        !ListView_GetCheckState(reopened.device_list, 3),
+        "Turning every USB channel off supersedes the previously enabled state on reconnect");
+    ListView_SetCheckState(reopened.device_list, 1, TRUE);
+    ui_fixture_capture_channels = 1;
+    refresh_devices(reopened);
+    refresh_devices(reopened);
+    ui_fixture_capture_channels = 2;
+    refresh_devices(reopened);
+    check(!ListView_GetCheckState(reopened.device_list, 0) &&
+        ListView_GetCheckState(reopened.device_list, 1),
+        "Temporarily unavailable channels retain their individual switch state");
+    DestroyWindow(window);
+    ui_fixture_reload_profile = false;
+  }
+  {
+    ui_fixture_saved_profile = {};
+    ui_fixture_saved_profile.initialized = true;
+    ui_fixture_saved_profile.input_device_ids = {L"fixture-pin-0"};
+    ui_fixture_saved_profile.output_device_ids = {L"fixture-pin-2"};
+    ui_fixture_reload_profile = ui_fixture_omit_usb = true;
+    AppState app;
+    app.tray_enabled = false;
+    const auto window = create_fixture_window(app, instance, L"Legacy offline selection fixture");
+    if (!window) return 1;
+    ListView_SetCheckState(app.device_list, 1, FALSE);
+    refresh_devices(app);
+    ui_fixture_omit_usb = false;
+    refresh_devices(app);
+    const bool restored = ListView_GetCheckState(app.device_list, 0) &&
+        ListView_GetCheckState(app.device_list, 1) &&
+        !ListView_GetCheckState(app.device_list, 2) &&
+        !ListView_GetCheckState(app.device_list, 3) &&
+        ListView_GetCheckState(app.device_list, 4) &&
+        !ListView_GetCheckState(app.device_list, 5);
+    std::printf("Legacy endpoint selection survives offline migration without losing newer channel edits: %s\n",
+        restored ? "PASS" : "FAIL");
+    passed = restored && passed;
+    DestroyWindow(window);
+    ui_fixture_reload_profile = false;
+  }
   {
     AppState app;
     app.tray_enabled = false;

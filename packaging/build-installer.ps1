@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(1, 65535)][int]$ReleaseNumber = 19,
+    [ValidateRange(1, 65535)][int]$ReleaseNumber = 21,
     [string]$BinaryDirectory,
     [string]$VerifiedManifest,
     [string]$Compiler,

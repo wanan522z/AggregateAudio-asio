@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([ValidateRange(1, 65535)][int]$ReleaseNumber = 19, [string]$Compiler)
+param([ValidateRange(1, 65535)][int]$ReleaseNumber = 21, [string]$Compiler)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Compiler) { $Compiler = Join-Path $taskRoot 'build\packaging-tools\inno-7.1.0\tools\ISCC.exe' }

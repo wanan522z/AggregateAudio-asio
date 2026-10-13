@@ -20,7 +20,7 @@ powered by WanAn522z
 
 ## 安装与使用
 
-使用打包生成的 `dist\AggregateAudio-v19-x64-Setup.exe`。安装程序包含 Microsoft x64 Visual C++ 运行库，注册 64 位 ASIO 驱动，并创建快捷方式和卸载入口。ASIO 注册名、宿主可见描述和 COM 显示名统一为 `Aggregate Audio`。
+使用打包生成的 `dist\AggregateAudio-v21-x64-Setup.exe`。安装程序包含 Microsoft x64 Visual C++ 运行库，注册 64 位 ASIO 驱动，并创建快捷方式和卸载入口。ASIO 注册名、宿主可见描述和 COM 显示名统一为 `Aggregate Audio`。
 
 1. 关闭 DAW 和配置窗口，运行 Setup 安装。
 2. 打开 Aggregate Audio 配置程序，展开设备并勾选需要的输入、输出声道。
@@ -34,6 +34,8 @@ powered by WanAn522z
 设备占用检查读取 KS 引脚实例数，不创建测试音频流。实例容量已满的引脚会提示“设备被占用，请释放后再试”；本驱动和检测程序也会互相保护，避免同时打开同一引脚。自动检测需要先停止 DAW 并释放设备。缺少全局实例数属性时会继续查询局部实例数，兼容 E2x2 OTG 等驱动；若设备驱动完全不支持实例数查询，则在打开时处理其返回的占用错误。用户态程序无法拦截设备驱动自身的内核崩溃。此次 USB 驱动崩溃分析与兼容修正见 [修复记录](docs/device-busy-fix.md)。
 
 ASIO 启动后配置程序驻留托盘。点击托盘图标可以恢复窗口；ASIO 运行时关闭窗口会保留托盘入口。Settings 页面展示本次会话日志，返回设备页会保留尚未保存的编辑。
+
+配置窗口会在设备插拔后自动刷新列表，保留离线设备各声道的开关状态和 KS 缓冲；同一设备重新接入后恢复上次状态。设备离线期间保存其他设置也会保留这些记录。尚未保存的编辑在当前配置窗口内保留，关闭后以最后保存的配置为准。
 
 ## 编译
 
@@ -98,3 +100,5 @@ ctest --test-dir build\device-groups-v3 -C Release --output-on-failure
 - KS 工厂并不与 Windows 友好名称一一对应；相同名称不能证明是同一声道。
 - 安装程序和产品二进制未签名。
 - `third_party/asio-sdk` 使用其随附许可，提供 GPLv3 和专有许可选项。分发前请确认适用许可；详见 SDK 的许可文件及 `packaging/THIRD-PARTY-NOTICES.txt`。
+
+保存时遇到 Windows 输出占用的修复见 [v21 修复记录](docs/asio-save-device-busy.md)。驱动将占用错误返回给宿主，不在 ASIO 初始化/重置调用中弹出同步窗口。错误保存在 %LOCALAPPDATA%\AggregateASIO\driver-errors.log。

@@ -13,6 +13,8 @@
 #include <objbase.h>
 #include <avrt.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <cstdio>
 #include "ks_device_access.h"
 
 #include "combase.h"
@@ -42,6 +44,45 @@ constexpr size_t kMaximumAsioChannels = 256;
 
 std::atomic<HMODULE> g_module{nullptr};
 std::atomic<ULONGLONG> g_last_automatic_reset{};
+
+void append_driver_error(const char* phase, long status, const std::string& message) noexcept {
+  if (!g_module.load(std::memory_order_acquire)) return; // Do not write logs in fixtures.
+  try {
+    PWSTR folder = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &folder))) return;
+    std::wstring directory(folder);
+    CoTaskMemFree(folder);
+    directory += L"\\AggregateASIO";
+    CreateDirectoryW(directory.c_str(), nullptr);
+    const auto path = directory + L"\\driver-errors.log";
+    const auto previous = directory + L"\\driver-errors.previous.log";
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char prefix[160]{};
+    sprintf_s(prefix, "%04u-%02u-%02u %02u:%02u:%02u.%03u [pid=%lu tid=%lu] %s HRESULT=0x%08lX ",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+        GetCurrentProcessId(), GetCurrentThreadId(), phase, static_cast<unsigned long>(status));
+    const std::string line = std::string(prefix) + message + "\r\n";
+    const auto open_log = [&] {
+      return CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+          FILE_ATTRIBUTE_NORMAL, nullptr);
+    };
+    HANDLE file = open_log();
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 1024*1024) {
+      CloseHandle(file);
+      MoveFileExW(path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING);
+      file = open_log();
+      if (file == INVALID_HANDLE_VALUE) return;
+    }
+    // One write keeps each failure together when several host processes log.
+    DWORD written = 0;
+    WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(file);
+  } catch (...) {} // Diagnostic failure must not alter ASIO error handling.
+}
 
 struct ChannelBinding {
   size_t endpoint_index{};
@@ -129,7 +170,7 @@ class AggregateASIO final : public IASIO, public CUnknown {
       canonicalize_endpoint_selections(settings_, endpoints_);
       std::string error;
       if (!engine_.initialize(settings_, endpoints_, error)) {
-        report_engine_error(error);
+        report_engine_error("init", error);
         return ASIOFalse;
       }
       rebuild_channel_bindings();
@@ -178,7 +219,7 @@ class AggregateASIO final : public IASIO, public CUnknown {
       return ASE_HWMalfunction;
     }
     if (!engine_started) {
-      report_engine_error(error);
+      report_engine_error("start", error);
       return ASE_HWMalfunction;
     }
     publish_sample_position(0, qpc_nanoseconds());
@@ -352,7 +393,9 @@ class AggregateASIO final : public IASIO, public CUnknown {
         std::string error;
         if (!engine_.initialize(settings_, endpoints_, error)) {
           engine_needs_refresh_.store(true, std::memory_order_release);
-          report_engine_error(error);
+          input_bindings_.clear();
+          output_bindings_.clear();
+          report_engine_error("refresh", error);
           return ASE_HWMalfunction;
         }
         rebuild_channel_bindings();
@@ -488,10 +531,12 @@ class AggregateASIO final : public IASIO, public CUnknown {
     copy_message(error_message_, sizeof(error_message_), message);
   }
 
-  void report_engine_error(const std::string& message) {
+  void report_engine_error(const char* phase, const std::string& message) {
+    // ASIO calls run inside host lifecycle operations, often under api_mutex_.
+    // A modal window pumps host timers and can re-enter reset/destruction while
+    // init is still on the stack. Return the failure; the host owns its UI.
     set_error(message);
-    if (ks_device_access::is_busy(engine_.last_status()))
-      MessageBoxW(nullptr, ks_device_access::kBusyMessage, L"设备被占用", MB_OK | MB_ICONWARNING);
+    append_driver_error(phase, engine_.last_status(), message);
   }
 
   bool is_channel_active(bool input, long channel) const {
@@ -507,11 +552,14 @@ class AggregateASIO final : public IASIO, public CUnknown {
       const auto stream_count = input ? engine.input_stream_count() : engine.output_stream_count();
       for (size_t endpoint = 0; endpoint < stream_count; ++endpoint) {
         auto* stream = input ? engine.input_stream(endpoint) : engine.output_stream(endpoint);
+        const auto& saved_keys = input ? settings_.input_channel_keys : settings_.output_channel_keys;
+        // Offline selections from a whole-endpoint profile may not have
+        // per-channel keys until the configurator sees the endpoint again.
+        const bool explicit_channels = settings_.channel_selection_configured &&
+            endpoint_has_channel_selection(settings_, stream->id(), input ? Direction::input : Direction::output);
         for (unsigned channel = 0; channel < stream->channels(); ++channel) {
           if (result.size() >= kMaximumAsioChannels) return;
-          const auto& saved_keys = input ? settings_.input_channel_keys
-                                         : settings_.output_channel_keys;
-          if (settings_.channel_selection_configured &&
+          if (explicit_channels &&
               std::find(saved_keys.begin(), saved_keys.end(),
                         channel_selection_key(stream->id(), channel)) == saved_keys.end()) {
             continue;

@@ -12,6 +12,7 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <windows.h>
+#include <dbt.h>
 #include "ks_device_access.h"
 
 #include <algorithm>
@@ -45,6 +46,7 @@ constexpr int kSettings = 1013;
 constexpr int kRepository = 1014;
 constexpr UINT_PTR kProbeTimer = 1;
 constexpr UINT_PTR kTrayTimer = 2;
+constexpr UINT_PTR kDeviceRefreshTimer = 3;
 const UINT kTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
 struct ChannelRef {
@@ -449,6 +451,13 @@ bool selection_contains_endpoint(const AudioSettings& settings, const AudioEndpo
 bool selection_contains_channel(const AudioSettings& settings, const AudioEndpoint& endpoint,
                                 unsigned channel) {
   if (!settings.channel_selection_configured) return selection_contains_endpoint(settings, endpoint);
+  // An offline endpoint from an older whole-endpoint profile has no channel
+  // keys yet. Keep its selection until it reconnects and can be expanded.
+  const bool explicit_channels = endpoint_has_channel_selection(settings, endpoint.id, endpoint.direction) ||
+      std::any_of(endpoint.legacy_ids.begin(), endpoint.legacy_ids.end(), [&](const auto& alias) {
+        return endpoint_has_channel_selection(settings, alias, endpoint.direction);
+      });
+  if (!explicit_channels) return selection_contains_endpoint(settings, endpoint);
   const auto& keys = endpoint.direction == Direction::input
       ? settings.input_channel_keys : settings.output_channel_keys;
   const auto key = channel_selection_key(endpoint.id, channel);
@@ -553,12 +562,11 @@ void populate_device_list(AppState& app, const AudioSettings& selection) {
 
 AudioSettings selection_from_current_ui(const AppState& app) {
   AudioSettings selection = app.saved_settings;
-  selection.input_device_ids = selected_endpoint_ids(app, Direction::input);
-  selection.output_device_ids = selected_endpoint_ids(app, Direction::output);
-  selection.input_channel_keys = selected_channel_keys(app, Direction::input);
-  selection.output_channel_keys = selected_channel_keys(app, Direction::output);
-  selection.device_buffers = current_device_buffers(app);
-  selection.channel_selection_configured = true;
+  AudioSettings current;
+  current.input_channel_keys = selected_channel_keys(app, Direction::input);
+  current.output_channel_keys = selected_channel_keys(app, Direction::output);
+  current.device_buffers = current_device_buffers(app);
+  update_available_device_settings(selection, app.endpoints, current);
   return selection;
 }
 
@@ -817,12 +825,14 @@ bool can_enable_channel(AppState& app, size_t channel_index) {
 
 void save_profile(AppState& app) {
   AudioSettings settings = selection_from_current_ui(app);
-  if (settings.input_channel_keys.empty() && settings.output_channel_keys.empty()) {
+  const auto inputs = selected_channel_keys(app, Direction::input);
+  const auto outputs = selected_channel_keys(app, Direction::output);
+  if (inputs.empty() && outputs.empty()) {
     MessageBoxW(app.window, L"请至少勾选一个输入或输出声道。", L"尚未选择声道",
                 MB_OK | MB_ICONINFORMATION);
     return;
   }
-  if (settings.input_channel_keys.size() > 128 || settings.output_channel_keys.size() > 128) {
+  if (inputs.size() > 128 || outputs.size() > 128) {
     MessageBoxW(app.window, L"每个方向最多启用 128 个 ASIO 声道。", L"声道数量过多", MB_OK | MB_ICONINFORMATION);
     return;
   }
@@ -1286,6 +1296,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case config_tray::kStatusMessage:
       update_tray(*app);
       return 0;
+    case WM_DEVICECHANGE:
+      if (wparam == DBT_DEVNODES_CHANGED) {
+        // Windows broadcasts this to top-level windows, including hidden tray
+        // windows. Coalesce notifications while KS interfaces settle.
+        SetTimer(window, kDeviceRefreshTimer, 500, nullptr);
+      }
+      return TRUE;
     case config_tray::kDeviceRefreshMessage:
       try { refresh_devices(*app); } catch (...) {}
       append_log(*app, L"检测到已选设备变化或音频流停滞，已请求 DAW 重载驱动并刷新设备列表。");
@@ -1417,6 +1434,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_TIMER:
+      if (wparam == kDeviceRefreshTimer) {
+        if (app->probe_job && !app->probe_job->done.load()) return 0;
+        KillTimer(window, kDeviceRefreshTimer);
+        try { refresh_devices(*app); }
+        catch (...) { append_log(*app, L"枚举 KS 设备失败，请点“刷新设备”重试。"); }
+        return 0;
+      }
       if (wparam == kTrayTimer) {
         try { update_tray(*app); } catch (...) {}
         return 0;
@@ -1471,6 +1495,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_DESTROY:
       app->tray_icon.remove();
       KillTimer(window, kTrayTimer);
+      KillTimer(window, kDeviceRefreshTimer);
       if (app->probe_job && !app->probe_job->done.load()) {
         app->probe_job->cancelled.store(true);
         KillTimer(window, kProbeTimer);
