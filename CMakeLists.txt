@@ -7,6 +7,13 @@ target_compile_definitions(catalog_inspect PRIVATE UNICODE _UNICODE WIN32_LEAN_A
 target_compile_options(catalog_inspect PRIVATE /EHsc /utf-8 /W4 /permissive-)
 target_link_libraries(catalog_inspect PRIVATE ole32 uuid propsys setupapi)
 
+add_executable(ks_open_check tools/ks_open_check.cpp src/audio_engine.cpp src/device_catalog.cpp src/settings.cpp)
+target_include_directories(ks_open_check PRIVATE src)
+target_compile_features(ks_open_check PRIVATE cxx_std_20)
+target_compile_definitions(ks_open_check PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(ks_open_check PRIVATE /EHsc /utf-8 /W4 /permissive-)
+target_link_libraries(ks_open_check PRIVATE ole32 uuid propsys setupapi shell32 avrt ksuser)
+
 if(NOT WIN32)
   message(FATAL_ERROR "The aggregate audio driver is Windows-only.")
 endif()

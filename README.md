@@ -11,6 +11,8 @@ powered by WanAn522z
 - 按物理设备展示 Kernel Streaming（KS）输入、输出引脚，逐声道选择参与聚合的通道。
 - 分别设置每台设备的 KS 缓冲，同时设置全局 ASIO 主机缓冲和采样率。
 - 直接通过 `KsCreatePin` 打开设备；支持 WaveRT 映射循环缓冲和硬件通知，其他设备使用异步 KS 数据包。
+- 优先通过 KS 格式交集采用驱动返回的实际容器、有效位数和声道布局，支持 24-in-32、20-in-24 等 PCM；旧驱动保留格式回退。
+- 设备组内按通道名称自然排序，忽略英文大小写，数字按数值排列，同一端点的声道保持相邻。
 - 每个引脚使用独立工作线程和预分配的无锁环形缓冲；通过线性重采样和缓冲占用反馈补偿设备时钟差异。
 - 支持自动检测设备缓冲、设备故障恢复请求、托盘入口、会话日志和只读诊断。
 - 勾选、保存、探测及 ASIO 打开时检查 KS 引脚占用；检测到占用会提示释放设备，并停止格式和缓冲重试。
@@ -18,7 +20,7 @@ powered by WanAn522z
 
 ## 安装与使用
 
-使用打包生成的 `dist\AggregateAudio-v18-x64-Setup.exe`。安装程序包含 Microsoft x64 Visual C++ 运行库，注册 64 位 ASIO 驱动，并创建快捷方式和卸载入口。ASIO 注册名、宿主可见描述和 COM 显示名统一为 `Aggregate Audio`。
+使用打包生成的 `dist\AggregateAudio-v19-x64-Setup.exe`。安装程序包含 Microsoft x64 Visual C++ 运行库，注册 64 位 ASIO 驱动，并创建快捷方式和卸载入口。ASIO 注册名、宿主可见描述和 COM 显示名统一为 `Aggregate Audio`。
 
 1. 关闭 DAW 和配置窗口，运行 Setup 安装。
 2. 打开 Aggregate Audio 配置程序，展开设备并勾选需要的输入、输出声道。
@@ -77,6 +79,8 @@ ctest --test-dir build\device-groups-v3 -C Release --output-on-failure
 诊断包括回调间隔、静音和无效采样、各流的帧计数、溢出、欠载、恢复丢帧和延迟估计。驱动通过共享内存发布计数，不录制音频，不在音频线程写日志。延迟估计不包含 DAW 插件延迟，也不是物理回环测量。
 
 开发构建中的 `catalog_inspect.exe --access E2x2` 可只读检查指定名称设备的全局/局部实例数、属性错误码及占用判断，不创建音频流。
+
+`catalog_inspect.exe --formats Livejack` 只读查看原始格式范围和 48 kHz 格式交集。`ks_open_check.exe Livejack` 则明确创建停止状态的引脚以验证连接，不启动音频、不提交采集/播放数据，也不读写个人配置。此连接检查不能验证实际音频稳定性。v19 的硬件证据与测试范围见 [兼容修复记录](docs/ks-format-compatibility-v19.md)。
 
 ## 打包
 

@@ -1,6 +1,7 @@
 #include "audio_engine.h"
 #include "buffer_plan.h"
 #include "ks_device_access.h"
+#include "ks_audio_format.h"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -28,7 +29,7 @@ constexpr unsigned kMaximumChannelsPerEndpoint = 64;
 constexpr unsigned kMaximumRingFrames = 32768;
 
 enum class WorkerCommand : LONG { none, start, stop, shutdown };
-enum class SampleEncoding { float32, pcm32, pcm24, pcm16 };
+enum class SampleEncoding { float32, pcm32, pcm24, pcm16, pcm8 };
 
 std::string narrow(const std::wstring& text) {
   if (text.empty()) return {};
@@ -71,11 +72,13 @@ float decode_sample(const BYTE* data, SampleEncoding encoding) noexcept {
       std::memcpy(&value, data, sizeof(value));
       return static_cast<float>(value / 32768.0);
     }
+    case SampleEncoding::pcm8:
+      return (static_cast<int>(*data) - 128) / 128.0f;
   }
   return 0.0f;
 }
 
-void encode_sample(BYTE* data, SampleEncoding encoding, float sample) noexcept {
+void encode_sample(BYTE* data, SampleEncoding encoding, float sample, unsigned valid_bits = 0) noexcept {
   const double value = std::clamp(static_cast<double>(sample), -1.0, 1.0);
   switch (encoding) {
     case SampleEncoding::float32:
@@ -101,6 +104,17 @@ void encode_sample(BYTE* data, SampleEncoding encoding, float sample) noexcept {
       std::memcpy(data, &quantized, sizeof(quantized));
       break;
     }
+    case SampleEncoding::pcm8:
+      *data = static_cast<BYTE>(std::clamp(std::lround(value * 128.0) + 128, 0L, 255L));
+      break;
+  }
+  // Extensible PCM is left-aligned; padding bits must be zero on render.
+  const unsigned bits = encoding == SampleEncoding::pcm32 ? 32 : encoding == SampleEncoding::pcm24 ? 24
+      : encoding == SampleEncoding::pcm16 ? 16 : 8;
+  if (encoding != SampleEncoding::float32 && valid_bits && valid_bits < bits) {
+    const unsigned padding = bits - valid_bits;
+    for (unsigned index = 0; index < padding / 8; ++index) data[index] = 0;
+    if (padding % 8) data[padding / 8] &= static_cast<BYTE>(0xffu << (padding % 8));
   }
 }
 
@@ -240,13 +254,18 @@ struct FormatCandidate {
   SampleEncoding encoding;
   unsigned bits;
   bool floating_point;
+  unsigned valid_bits;
 };
 
-constexpr std::array<FormatCandidate, 4> kFormatCandidates{{
-    {SampleEncoding::float32, 32, true},
-    {SampleEncoding::pcm32, 32, false},
-    {SampleEncoding::pcm24, 24, false},
-    {SampleEncoding::pcm16, 16, false}}};
+constexpr std::array<FormatCandidate, 8> kFormatCandidates{{
+    {SampleEncoding::float32, 32, true, 32},
+    {SampleEncoding::pcm32, 32, false, 32},
+    {SampleEncoding::pcm32, 32, false, 24},
+    {SampleEncoding::pcm24, 24, false, 24},
+    {SampleEncoding::pcm32, 32, false, 20},
+    {SampleEncoding::pcm24, 24, false, 20},
+    {SampleEncoding::pcm16, 16, false, 16},
+    {SampleEncoding::pcm8, 8, false, 8}}};
 
 std::vector<unsigned> ordered_rates(const AudioEndpoint& endpoint, unsigned requested) {
   auto rates = endpoint.native_sample_rates;
@@ -314,7 +333,7 @@ std::vector<BYTE> make_connection(unsigned pin_id, const GUID& interface_set,
   wave->cbSize = extensible ? sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) : 0;
   if (extensible) {
     auto* extended = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(wave);
-    extended->Samples.wValidBitsPerSample = static_cast<WORD>(candidate.bits);
+    extended->Samples.wValidBitsPerSample = static_cast<WORD>(candidate.valid_bits);
     extended->dwChannelMask = channels == 1 ? SPEAKER_FRONT_CENTER
         : channels == 2 ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT)
                         : KSAUDIO_SPEAKER_DIRECTOUT;
@@ -364,8 +383,7 @@ class EndpointAudioStream::Impl {
       last_error_.store(hr, std::memory_order_release);
       error = ks_device_access::is_busy(hr)
           ? "Device is in use: " + narrow(endpoint_.name) + ". Release it and try again."
-          : "Could not create a KS pin for " + narrow(endpoint_.name) +
-              " at a supported rate, channel count, and PCM format (" + hresult_text(hr) + ").";
+          : "KS open failed " + hresult_text(hr) + ": " + narrow(endpoint_.name);
       return false;
     }
     thread_ = std::thread([this] { run(); });
@@ -566,79 +584,85 @@ class EndpointAudioStream::Impl {
         last_error = availability;
         continue;
       }
+      const auto ranges = ks_audio_format::read_ranges(filter, candidate.pin_id);
+      auto formats = std::vector<FormatCandidate>(kFormatCandidates.begin(), kFormatCandidates.end());
+      for (const auto& range : ranges) {
+        if (range.DataRange.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) continue;
+        for (const unsigned depth : {range.MinimumBitsPerSample, range.MaximumBitsPerSample}) {
+          if (!depth || depth > 32 || std::any_of(formats.begin(), formats.end(), [&](const auto& format) {
+                return !format.floating_point && format.valid_bits == depth;
+              })) continue;
+          const unsigned bits = depth <= 8 ? 8 : depth <= 16 ? 16 : depth <= 24 ? 24 : 32;
+          const SampleEncoding encoding = bits == 8 ? SampleEncoding::pcm8 : bits == 16 ? SampleEncoding::pcm16
+              : bits == 24 ? SampleEncoding::pcm24 : SampleEncoding::pcm32;
+          formats.push_back({encoding, bits, false, depth});
+        }
+      }
       auto rates = candidate.sample_rates.empty()
                        ? ordered_rates(endpoint_, sample_rate_) : candidate.sample_rates;
+      for (const auto& range : ranges) {
+        for (const unsigned rate : std::array<unsigned, 3>{sample_rate_,
+             static_cast<unsigned>(range.MinimumSampleFrequency), static_cast<unsigned>(range.MaximumSampleFrequency)}) {
+          if (rate >= 8000 && rate <= 384000 && rate >= range.MinimumSampleFrequency &&
+              (!range.MaximumSampleFrequency || rate <= range.MaximumSampleFrequency) &&
+              std::find(rates.begin(), rates.end(), rate) == rates.end()) rates.push_back(rate);
+        }
+      }
       std::stable_sort(rates.begin(), rates.end(), [&](unsigned left, unsigned right) {
         const auto left_delta = left > sample_rate_ ? left - sample_rate_ : sample_rate_ - left;
         const auto right_delta = right > sample_rate_ ? right - sample_rate_ : sample_rate_ - right;
         return left_delta < right_delta;
       });
       const auto channels = channel_candidates(candidate.channels ? candidate.channels : endpoint_.channels);
+      // Negotiate all advertised formats before guessing legacy layouts. In
+      // particular, a 24-bit range can require a 32-bit extensible container.
+      bool intersection_unavailable = false;
       for (const unsigned count : channels) {
         for (const unsigned rate : rates) {
-          for (const auto& format : kFormatCandidates) {
+          std::vector<unsigned> queried;
+          for (const auto& format : formats) {
+            const unsigned key = format.valid_bits + (format.floating_point ? 256 : 0);
+            if (intersection_unavailable || std::find(queried.begin(), queried.end(), key) != queried.end() ||
+                !ks_audio_format::supports(ranges, count, rate, format.valid_bits, format.floating_point)) continue;
+            queried.push_back(key);
+            std::vector<BYTE> native_format;
+            ks_audio_format::WaveFormat native{};
+            const HRESULT negotiated = ks_audio_format::intersect(filter, candidate.pin_id,
+                count, rate, format.valid_bits, format.floating_point, native_format, native);
+            if (FAILED(negotiated)) {
+              if (ks_device_access::is_busy(negotiated)) { CloseHandle(filter); return negotiated; }
+              if (negotiated == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) ||
+                  negotiated == HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION) ||
+                  negotiated == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) ||
+                  negotiated == HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND) ||
+                  negotiated == HRESULT_FROM_WIN32(ERROR_CALL_NOT_IMPLEMENTED)) intersection_unavailable = true;
+              continue;
+            }
+            auto connection = make_connection(candidate.pin_id, candidate.interface_set, candidate.interface_id,
+                candidate.medium_set, candidate.medium_id, count, rate, format, true);
+            connection.resize(sizeof(KSPIN_CONNECT) + native_format.size());
+            std::memcpy(connection.data() + sizeof(KSPIN_CONNECT), native_format.data(), native_format.size());
+            last_error = try_connection(filter, connection, access, native);
+            if (SUCCEEDED(last_error) || ks_device_access::is_busy(last_error) || last_error == E_OUTOFMEMORY) {
+              CloseHandle(filter);
+              return last_error;
+            }
+          }
+        }
+      }
+      for (const unsigned count : channels) {
+        for (const unsigned rate : rates) {
+          for (const auto& format : formats) {
+            if (!ks_audio_format::supports(ranges, count, rate, format.valid_bits, format.floating_point)) continue;
             for (const bool extensible : {true, false}) {
-              if (!extensible && count > 2) continue;
+              if (!extensible && (count > 2 || format.valid_bits != format.bits)) continue;
               auto connection = make_connection(candidate.pin_id,
                   candidate.interface_set, candidate.interface_id,
                   candidate.medium_set, candidate.medium_id,
                   count, rate, format, extensible);
-              HANDLE pin = INVALID_HANDLE_VALUE;
-              const DWORD status = KsCreatePin(filter,
-                  reinterpret_cast<PKSPIN_CONNECT>(connection.data()), access, &pin);
-              if (status == ERROR_SUCCESS && pin != INVALID_HANDLE_VALUE) {
-                channels_ = count;
-                device_sample_rate_ = rate;
-                encoding_ = format.encoding;
-                bits_per_sample_ = format.bits;
-                block_align_ = count * format.bits / 8;
-                const unsigned requested_stream_frames = std::clamp<unsigned>(static_cast<unsigned>(
-                    (static_cast<unsigned long long>(buffer_frames_) * rate + sample_rate_ - 1) /
-                    std::max(1u, sample_rate_)), 16u, 8192u);
-                stream_frames_ = requested_stream_frames;
-                bool wave_rt_requested = false;
-                if (initialize_wave_rt(pin, wave_rt_requested)) {
-                  pin_handle_ = pin;
-                  CloseHandle(filter);
-                  return S_OK;
-                }
-                if (!wave_rt_requested) {
-                  // An ordinary KS pin needs no close/reopen cycle when the
-                  // support query says WaveRT mapping is unavailable.
-                  pin_handle_ = pin;
-                  const bool initialized = initialize_transfer_buffers();
-                  if (!initialized) close_handle(pin_handle_);
-                  CloseHandle(filter);
-                  return initialized ? S_OK : E_OUTOFMEMORY;
-                }
-                unregister_wave_rt(pin);
-                CloseHandle(pin);
-                stream_frames_ = requested_stream_frames;
-
-                // Some filters expose KS pins but do not implement WaveRT. Try
-                // the standard stream-I/O path with a fresh pin instance.
-                pin = INVALID_HANDLE_VALUE;
-                const DWORD retry = KsCreatePin(filter,
-                    reinterpret_cast<PKSPIN_CONNECT>(connection.data()), access, &pin);
-                if (retry == ERROR_SUCCESS && pin != INVALID_HANDLE_VALUE) {
-                  pin_handle_ = pin;
-                  if (initialize_transfer_buffers()) {
-                    CloseHandle(filter);
-                    return S_OK;
-                  }
-                  close_handle(pin_handle_);
-                  CloseHandle(filter);
-                  return E_OUTOFMEMORY;
-                }
-                last_error = HRESULT_FROM_WIN32(retry);
-                if (ks_device_access::is_busy(last_error)) {
-                  CloseHandle(filter);
-                  return last_error;
-                }
-                continue;
-              }
-              last_error = HRESULT_FROM_WIN32(status);
-              if (ks_device_access::is_busy(last_error)) {
+              last_error = try_connection(filter, connection, access,
+                  {count, rate, format.bits, format.valid_bits, format.floating_point});
+              if (SUCCEEDED(last_error) || ks_device_access::is_busy(last_error) || last_error == E_OUTOFMEMORY) {
                 CloseHandle(filter);
                 return last_error;
               }
@@ -649,6 +673,47 @@ class EndpointAudioStream::Impl {
       CloseHandle(filter);
     }
     return last_error;
+  }
+
+  HRESULT try_connection(HANDLE filter, std::vector<BYTE>& connection, DWORD access,
+                         const ks_audio_format::WaveFormat& format) {
+    HANDLE pin = INVALID_HANDLE_VALUE;
+    const DWORD status = KsCreatePin(filter, reinterpret_cast<PKSPIN_CONNECT>(connection.data()), access, &pin);
+    if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
+    if (!pin || pin == INVALID_HANDLE_VALUE) return E_FAIL;
+    channels_ = format.channels;
+    device_sample_rate_ = format.rate;
+    encoding_ = format.floating_point ? SampleEncoding::float32 : format.bits == 32 ? SampleEncoding::pcm32
+        : format.bits == 24 ? SampleEncoding::pcm24 : format.bits == 16 ? SampleEncoding::pcm16 : SampleEncoding::pcm8;
+    bits_per_sample_ = format.bits;
+    valid_bits_per_sample_ = format.valid_bits;
+    block_align_ = channels_ * bits_per_sample_ / 8;
+    const unsigned requested_stream_frames = std::clamp<unsigned>(static_cast<unsigned>(
+        (static_cast<unsigned long long>(buffer_frames_) * device_sample_rate_ + sample_rate_ - 1) /
+        std::max(1u, sample_rate_)), 16u, 8192u);
+    stream_frames_ = requested_stream_frames;
+    bool wave_rt_requested = false;
+    if (initialize_wave_rt(pin, wave_rt_requested)) {
+      pin_handle_ = pin;
+      return S_OK;
+    }
+    if (!wave_rt_requested) {
+      pin_handle_ = pin;
+      const bool initialized = initialize_transfer_buffers();
+      if (!initialized) close_handle(pin_handle_);
+      return initialized ? S_OK : E_OUTOFMEMORY;
+    }
+    unregister_wave_rt(pin);
+    CloseHandle(pin);
+    stream_frames_ = requested_stream_frames;
+    pin = INVALID_HANDLE_VALUE;
+    const DWORD retry = KsCreatePin(filter, reinterpret_cast<PKSPIN_CONNECT>(connection.data()), access, &pin);
+    if (retry != ERROR_SUCCESS) return HRESULT_FROM_WIN32(retry);
+    if (!pin || pin == INVALID_HANDLE_VALUE) return E_FAIL;
+    pin_handle_ = pin;
+    if (initialize_transfer_buffers()) return S_OK;
+    close_handle(pin_handle_);
+    return E_OUTOFMEMORY;
   }
 
   bool initialize_transfer_buffers() noexcept {
@@ -735,7 +800,7 @@ class EndpointAudioStream::Impl {
     // leaving the next half silent and causing persistent playback underruns.
     rt_next_segment_ = 0u;
     if (!is_input()) {
-      std::memset(rt_buffer_address_, 0, rt_buffer_size_);
+      std::memset(rt_buffer_address_, encoding_ == SampleEncoding::pcm8 ? 128 : 0, rt_buffer_size_);
       if (rt_call_memory_barrier_) MemoryBarrier();
     }
 
@@ -893,7 +958,7 @@ class EndpointAudioStream::Impl {
     const size_t samples = static_cast<size_t>(stream_frames_) * channels_;
     const unsigned bytes_per_sample = bits_per_sample_ / 8;
     for (size_t i = 0; i < samples; ++i) {
-      encode_sample(packet.data.data() + i * bytes_per_sample, encoding_, conversion_buffer_[i]);
+      encode_sample(packet.data.data() + i * bytes_per_sample, encoding_, conversion_buffer_[i], valid_bits_per_sample_);
     }
     auto& header = packet.header;
     header = {};
@@ -1019,7 +1084,7 @@ class EndpointAudioStream::Impl {
       const size_t samples = static_cast<size_t>(rt_frames_per_notification_) * channels_;
       const unsigned bytes_per_sample = bits_per_sample_ / 8;
       for (size_t i = 0; i < samples; ++i) {
-        encode_sample(segment + i * bytes_per_sample, encoding_, conversion_buffer_[i]);
+        encode_sample(segment + i * bytes_per_sample, encoding_, conversion_buffer_[i], valid_bits_per_sample_);
       }
       if (rt_call_memory_barrier_) MemoryBarrier();
     }
@@ -1059,7 +1124,7 @@ class EndpointAudioStream::Impl {
             ResetEvent(rt_event_);
             rt_next_segment_ = 0;
             if (!is_input()) {
-              std::memset(rt_buffer_address_, 0, rt_buffer_size_);
+              std::memset(rt_buffer_address_, encoding_ == SampleEncoding::pcm8 ? 128 : 0, rt_buffer_size_);
               if (rt_call_memory_barrier_) MemoryBarrier();
             }
           }
@@ -1156,6 +1221,7 @@ class EndpointAudioStream::Impl {
   unsigned device_sample_rate_{};
   unsigned channels_{};
   unsigned bits_per_sample_{};
+  unsigned valid_bits_per_sample_{};
   unsigned block_align_{};
   unsigned stream_frames_{};
   SampleEncoding encoding_{SampleEncoding::float32};

@@ -7,6 +7,7 @@
 #include <mmreg.h>
 #include <ks.h>
 #include <ksmedia.h>
+#include "ks_audio_format.h"
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
@@ -502,58 +503,45 @@ bool get_pin_interface_and_medium(HANDLE filter, ULONG pin_id,
 }
 
 bool summarize_pin_formats(HANDLE filter, ULONG pin_id, AudioEndpoint& endpoint) {
-  std::vector<BYTE> ranges(128 * 1024);
-  ULONG bytes = 0;
-  if (FAILED(get_pin_property(filter, pin_id, KSPROPERTY_PIN_DATARANGES,
-                              ranges.data(), static_cast<ULONG>(ranges.size()), &bytes)) ||
-      bytes < sizeof(KSMULTIPLE_ITEM)) return false;
-
-  const auto* multiple = reinterpret_cast<const KSMULTIPLE_ITEM*>(ranges.data());
-  if (multiple->Size > bytes || multiple->Size < sizeof(KSMULTIPLE_ITEM)) return false;
-  size_t offset = sizeof(KSMULTIPLE_ITEM);
+  const auto ranges = ks_audio_format::read_ranges(filter, pin_id);
   unsigned minimum_rate = 384000;
   unsigned maximum_rate = 0;
   unsigned maximum_channels = 0;
   unsigned minimum_bits = 32;
   unsigned maximum_bits = 0;
-  constexpr std::array<unsigned, 9> rates{
-      32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
-  constexpr std::array<unsigned, 4> bit_depths{32, 24, 16, 0};
+  constexpr std::array<unsigned, 13> rates{
+      8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
+  constexpr std::array<unsigned, 5> bit_depths{32, 24, 20, 16, 8};
 
-  for (ULONG index = 0; index < multiple->Count; ++index) {
-    if (offset + sizeof(KSDATARANGE_AUDIO) > multiple->Size) break;
-    const auto* range = reinterpret_cast<const KSDATARANGE_AUDIO*>(ranges.data() + offset);
-    if (range->DataRange.FormatSize < sizeof(KSDATARANGE_AUDIO) ||
-        offset + range->DataRange.FormatSize > multiple->Size) break;
-    if (IsEqualGUID(range->DataRange.MajorFormat, KSDATAFORMAT_TYPE_AUDIO) &&
-        (IsEqualGUID(range->DataRange.SubFormat, KSDATAFORMAT_SUBTYPE_PCM) ||
-         IsEqualGUID(range->DataRange.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ||
-         IsEqualGUID(range->DataRange.SubFormat, GUID_NULL))) {
-      const unsigned min_rate = range->MinimumSampleFrequency ? range->MinimumSampleFrequency : 8000;
-      const unsigned max_rate = range->MaximumSampleFrequency ? range->MaximumSampleFrequency : 384000;
-      const unsigned min_depth = range->MinimumBitsPerSample ? range->MinimumBitsPerSample : 16;
-      const unsigned max_depth = range->MaximumBitsPerSample ? range->MaximumBitsPerSample : 32;
-      maximum_channels = std::max(maximum_channels,
-                                  static_cast<unsigned>(range->MaximumChannels));
-      minimum_rate = std::min(minimum_rate, min_rate);
-      maximum_rate = std::max(maximum_rate, max_rate);
-      minimum_bits = std::min(minimum_bits, min_depth);
-      maximum_bits = std::max(maximum_bits, max_depth);
+  for (const auto& audio : ranges) {
+    const auto* range = &audio;
+    const unsigned min_rate = range->MinimumSampleFrequency ? range->MinimumSampleFrequency : 8000;
+    const unsigned max_rate = range->MaximumSampleFrequency ? range->MaximumSampleFrequency : 384000;
+    const unsigned min_depth = range->MinimumBitsPerSample ? range->MinimumBitsPerSample : 8;
+    const unsigned max_depth = range->MaximumBitsPerSample ? range->MaximumBitsPerSample : 32;
+    maximum_channels = std::max(maximum_channels,
+                                static_cast<unsigned>(range->MaximumChannels));
+    minimum_rate = std::min(minimum_rate, min_rate);
+    maximum_rate = std::max(maximum_rate, max_rate);
+    minimum_bits = std::min(minimum_bits, min_depth);
+    maximum_bits = std::max(maximum_bits, max_depth);
 
-      for (const unsigned rate : rates) {
-        if (rate < min_rate || rate > max_rate) continue;
-        endpoint.native_sample_rates.push_back(rate);
-        for (const unsigned depth : bit_depths) {
-          const unsigned tested_depth = depth == 0 ? 32 : depth;
-          if (tested_depth < min_depth || tested_depth > max_depth) continue;
-          const bool is_float = depth == 0 ||
-              IsEqualGUID(range->DataRange.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
-          endpoint.native_formats.push_back(std::to_string(tested_depth) +
-              (is_float ? "-bit float @ " : "-bit PCM @ ") + std::to_string(rate));
-        }
+    auto range_rates = std::vector<unsigned>(rates.begin(), rates.end());
+    range_rates.push_back(min_rate);
+    range_rates.push_back(max_rate);
+    for (const unsigned rate : range_rates) {
+      if (rate < 8000 || rate > 384000) continue;
+      if (rate < min_rate || rate > max_rate) continue;
+      endpoint.native_sample_rates.push_back(rate);
+      for (const unsigned depth : bit_depths) {
+        const unsigned tested_depth = depth;
+        if (tested_depth < min_depth || tested_depth > max_depth) continue;
+        const bool is_float = IsEqualGUID(range->DataRange.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        if (is_float && depth != 32) continue;
+        endpoint.native_formats.push_back(std::to_string(tested_depth) +
+            (is_float ? "-bit float @ " : "-bit PCM @ ") + std::to_string(rate));
       }
     }
-    offset += range->DataRange.FormatSize;
   }
 
   std::ranges::sort(endpoint.native_sample_rates);
@@ -575,7 +563,7 @@ bool summarize_pin_formats(HANDLE filter, ULONG pin_id, AudioEndpoint& endpoint)
                                    endpoint.native_sample_rates.end(), 48000u) !=
                         endpoint.native_sample_rates.end()
       ? 48000 : endpoint.native_sample_rates.front();
-  endpoint.bits_per_sample = std::clamp(maximum_bits, 16u, 32u);
+  endpoint.bits_per_sample = std::clamp(maximum_bits, 8u, 32u);
   (void)minimum_bits;
   return true;
 }

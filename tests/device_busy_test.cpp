@@ -6,12 +6,16 @@
 #include <ks.h>
 #include <ksmedia.h>
 #include <cstdio>
+#include <cstring>
+#include <utility>
 #include <unordered_set>
 
 namespace {
 DWORD filter_error{}, create_error{}, count_error{ERROR_NOT_SUPPORTED};
 DWORD global_count_error{}, local_count_error{};
 bool global_busy{}, local_busy{}, short_counts{}, rt_supported{}, rt_mapping_fails{};
+bool negotiated_pcm{}, intersection_supported{true};
+unsigned native_bits{32}, native_valid_bits{24}, intersection_queries{};
 unsigned create_calls{}, filter_calls{}, mapping_calls{};
 unsigned busy_on_call{};
 unsigned possible_count{1}, busy_filter_call{};
@@ -29,19 +33,67 @@ BOOL WINAPI fake_close(HANDLE handle) {
   device_handles.erase(handle);
   return CloseHandle(handle);
 }
-DWORD WINAPI fake_create_pin(HANDLE, PKSPIN_CONNECT, ACCESS_MASK, PHANDLE pin) {
+DWORD WINAPI fake_create_pin(HANDLE, PKSPIN_CONNECT connect, ACCESS_MASK, PHANDLE pin) {
   ++create_calls;
   if (create_error) return create_error;
   if (busy_on_call == create_calls) return ERROR_BUSY;
+  if (negotiated_pcm) {
+    const auto* data = reinterpret_cast<const KSDATAFORMAT*>(connect + 1);
+    const auto* wave = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(data + 1);
+    if (data->SubFormat != KSDATAFORMAT_SUBTYPE_PCM ||
+        wave->Format.wFormatTag != WAVE_FORMAT_EXTENSIBLE || wave->Format.nChannels != 2 ||
+        wave->Format.nSamplesPerSec != 48000 || wave->Format.wBitsPerSample != native_bits ||
+        wave->Samples.wValidBitsPerSample != native_valid_bits ||
+        wave->Format.nBlockAlign != 2 * native_bits / 8 ||
+        (intersection_supported && data->SampleSize != 0)) return ERROR_NO_MATCH;
+  }
   *pin = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   device_handles.insert(*pin);
   return ERROR_SUCCESS;
 }
 BOOL WINAPI fake_ioctl(HANDLE, DWORD code, LPVOID input, DWORD, LPVOID output,
-                       DWORD, LPDWORD returned, LPOVERLAPPED) {
+                       DWORD output_size, LPDWORD returned, LPOVERLAPPED) {
   *returned = 0;
   if (code == IOCTL_KS_PROPERTY && input) {
     const auto& property = *static_cast<KSPROPERTY*>(input);
+    if (negotiated_pcm && property.Set == KSPROPSETID_Pin && property.Id == KSPROPERTY_PIN_DATARANGES) {
+      // Include a shorter non-audio range before the audio capabilities.
+      struct Ranges { KSMULTIPLE_ITEM list; KSDATARANGE other; KSDATARANGE_AUDIO audio; } ranges{};
+      ranges.list = {sizeof(ranges), 2};
+      ranges.other.FormatSize = sizeof(KSDATARANGE);
+      ranges.audio.DataRange = {sizeof(KSDATARANGE_AUDIO), 0, 0, 0,
+          KSDATAFORMAT_TYPE_AUDIO, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX};
+      ranges.audio.MaximumChannels = 2;
+      ranges.audio.MinimumBitsPerSample = ranges.audio.MaximumBitsPerSample = native_valid_bits;
+      ranges.audio.MinimumSampleFrequency = ranges.audio.MaximumSampleFrequency = 48000;
+      if (output_size < sizeof(ranges)) return FALSE;
+      std::memcpy(output, &ranges, sizeof(ranges));
+      *returned = sizeof(ranges);
+      return TRUE;
+    }
+    if (negotiated_pcm && property.Set == KSPROPSETID_Pin && property.Id == KSPROPERTY_PIN_DATAINTERSECTION) {
+      ++intersection_queries;
+      if (!intersection_supported) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+      const auto* range = reinterpret_cast<const KSDATARANGE_AUDIO*>(
+          static_cast<const BYTE*>(input) + sizeof(KSP_PIN) + sizeof(KSMULTIPLE_ITEM));
+      if (range->DataRange.SubFormat != KSDATAFORMAT_SUBTYPE_PCM || range->MaximumChannels != 2 ||
+          range->MinimumBitsPerSample != native_valid_bits || range->MinimumSampleFrequency != 48000) {
+        SetLastError(ERROR_NO_MATCH); return FALSE;
+      }
+      if (output_size < sizeof(KSDATAFORMAT) + sizeof(WAVEFORMATEXTENSIBLE)) return FALSE;
+      auto* data = static_cast<KSDATAFORMAT*>(output);
+      *data = {sizeof(KSDATAFORMAT) + sizeof(WAVEFORMATEXTENSIBLE), 0, 0, 0,
+          KSDATAFORMAT_TYPE_AUDIO, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX};
+      auto* wave = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(data + 1);
+      *wave = {};
+      wave->Format = {WAVE_FORMAT_EXTENSIBLE, 2, 48000, 48000 * 2 * native_bits / 8,
+          static_cast<WORD>(2 * native_bits / 8), static_cast<WORD>(native_bits), 22};
+      wave->Samples.wValidBitsPerSample = static_cast<WORD>(native_valid_bits);
+      wave->dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+      wave->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+      *returned = data->FormatSize;
+      return TRUE;
+    }
     if (property.Set == KSPROPSETID_Pin &&
         (property.Id == KSPROPERTY_PIN_GLOBALCINSTANCES || property.Id == KSPROPERTY_PIN_CINSTANCES)) {
       const bool global = property.Id == KSPROPERTY_PIN_GLOBALCINSTANCES;
@@ -110,6 +162,8 @@ void reset() {
   create_calls = filter_calls = mapping_calls = 0;
   possible_count = 1; busy_filter_call = 0;
   global_count_error = local_count_error = global_queries = local_queries = 0;
+  negotiated_pcm = false; intersection_supported = true; intersection_queries = 0;
+  native_bits = 32; native_valid_bits = 24;
 }
 }
 
@@ -123,6 +177,58 @@ int main() {
   AudioSettings settings;
   settings.output_device_ids = {device.id};
   std::string error;
+  for (const auto layout : {std::pair{32u, 24u}, std::pair{24u, 24u}, std::pair{32u, 20u},
+                           std::pair{16u, 16u}, std::pair{24u, 22u}, std::pair{8u, 8u}}) {
+    for (const Direction direction : {Direction::input, Direction::output}) {
+      reset(); negotiated_pcm = true; native_bits = layout.first; native_valid_bits = layout.second;
+      auto native_device = device;
+      native_device.direction = direction;
+      AudioSettings native_settings;
+      (direction == Direction::input ? native_settings.input_device_ids : native_settings.output_device_ids) = {device.id};
+      AudioEngine engine;
+      check(engine.initialize(native_settings, {native_device}, error) && create_calls == 1 && intersection_queries == 1,
+          "Advertised PCM intersection preserves exact container, valid bits and sample size on first open");
+    }
+  }
+  reset(); negotiated_pcm = true; intersection_supported = false;
+  {
+    AudioEngine engine;
+    check(engine.initialize(settings, {device}, error) && intersection_queries == 1,
+        "Legacy driver without intersection can open 24 valid bits in a 32-bit container");
+  }
+  reset(); negotiated_pcm = true; create_error = ERROR_BUSY;
+  {
+    AudioEngine engine;
+    check(!engine.initialize(settings, {device}, error) && create_calls == 1 && intersection_queries == 1 &&
+        ks_device_access::is_busy(engine.last_status()), "Negotiated open race stops before legacy retries");
+  }
+  {
+    BYTE sample[4]{};
+    encode_sample(sample, SampleEncoding::pcm32, 0.1234567f, 24);
+    check(sample[0] == 0 && std::abs(decode_sample(sample, SampleEncoding::pcm32) - 0.1234567f) < 0.000001f,
+        "24-in-32 PCM stays left aligned with zero render padding and correct capture scale");
+    encode_sample(sample, SampleEncoding::pcm24, -0.1234567f, 20);
+    check((sample[0] & 0x0f) == 0 && std::abs(decode_sample(sample, SampleEncoding::pcm24) + 0.1234567f) < 0.000002f,
+        "20-in-24 PCM preserves sign, scale and zero padding");
+    for (const float value : {-1.0f, 0.0f, 0.5f}) {
+      encode_sample(sample, SampleEncoding::pcm8, value, 8);
+      check(decode_sample(sample, SampleEncoding::pcm8) == value, "Unsigned 8-bit PCM uses midpoint silence");
+    }
+    std::vector<BYTE> format;
+    ks_audio_format::WaveFormat info{};
+    check(SUCCEEDED(ks_audio_format::intersect(nullptr, 0, 2, 48000, 24, false, format, info)),
+        "Fixture provides a valid driver intersection");
+    auto* data = reinterpret_cast<KSDATAFORMAT*>(format.data());
+    auto* wave = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(data + 1);
+    wave->Format.nBlockAlign = 1;
+    check(!ks_audio_format::validate(format.data(), format.size(), info), "Reject incorrect negotiated frame stride");
+    wave->Format.nBlockAlign = 8;
+    wave->Samples.wValidBitsPerSample = 33;
+    check(!ks_audio_format::validate(format.data(), format.size(), info), "Reject valid bits exceeding container width");
+    wave->Samples.wValidBitsPerSample = 24;
+    data->FormatSize = 4096;
+    check(!ks_audio_format::validate(format.data(), format.size(), info), "Reject truncated driver intersection");
+  }
   reset(); count_error = 0; global_count_error = ERROR_NOT_FOUND;
   {
     check(SUCCEEDED(ks_device_access::check_endpoint(device)) && local_queries == 1 && create_calls == 0,

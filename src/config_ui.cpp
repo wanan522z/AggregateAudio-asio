@@ -162,6 +162,13 @@ bool same_text(const std::wstring& left, const std::wstring& right) {
                               right.c_str(), static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
 }
 
+int compare_channel_names(const std::wstring& left, const std::wstring& right) {
+  const int result = CompareStringEx(LOCALE_NAME_INVARIANT, NORM_IGNORECASE | SORT_DIGITSASNUMBERS,
+      left.c_str(), static_cast<int>(left.size()), right.c_str(), static_cast<int>(right.size()),
+      nullptr, nullptr, 0);
+  return result ? result - CSTR_EQUAL : left.compare(right);
+}
+
 std::wstring format_rates(const std::vector<unsigned>& rates) {
   std::wstring text;
   for (const auto rate : rates) {
@@ -490,7 +497,20 @@ void populate_device_list(AppState& app, const AudioSettings& selection) {
   }
   ListView_EnableGroupView(app.device_list, TRUE);
 
-  for (size_t endpoint_index = 0; endpoint_index < app.endpoints.size(); ++endpoint_index) {
+  std::vector<size_t> endpoint_order;
+  for (size_t index = 0; index < app.endpoints.size(); ++index) endpoint_order.push_back(index);
+  std::stable_sort(endpoint_order.begin(), endpoint_order.end(), [&](size_t left, size_t right) {
+    if (endpoint_groups[left] != endpoint_groups[right]) return endpoint_groups[left] < endpoint_groups[right];
+    const auto& a = app.endpoints[left];
+    const auto& b = app.endpoints[right];
+    const int name = compare_channel_names(a.pin_role.empty() ? a.name : a.pin_role,
+        b.pin_role.empty() ? b.name : b.pin_role);
+    if (name) return name < 0;
+    if (a.direction != b.direction) return a.direction == Direction::input;
+    if (a.ks_pin_id != b.ks_pin_id) return a.ks_pin_id < b.ks_pin_id;
+    return a.id < b.id;
+  });
+  for (const size_t endpoint_index : endpoint_order) {
     const auto& endpoint = app.endpoints[endpoint_index];
     const size_t device_index = endpoint_groups[endpoint_index];
     for (unsigned channel = 0; channel < endpoint.channels; ++channel) {

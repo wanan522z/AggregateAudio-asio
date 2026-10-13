@@ -692,8 +692,8 @@ int wmain(int argc, wchar_t** argv) {
     check(preserved, "Repeated background refresh preserves pixel scroll, selected channel and collapsed groups");
     ui_fixture_reverse_catalog = true;
     SendMessageW(window, config_tray::kDeviceRefreshMessage, 0, 0);
-    check(ListView_GetNextItem(app.device_list, -1, LVNI_SELECTED) == 35 &&
-        ListView_GetItemRect(app.device_list, 34, &after, LVIR_BOUNDS) &&
+    check(channel_key_at_row(app, ListView_GetNextItem(app.device_list, -1, LVNI_SELECTED)) == L"fixture-pin-0:ch=31" &&
+        ListView_GetItemRect(app.device_list, row_for_channel_key(app, L"fixture-pin-0:ch=30"), &after, LVIR_BOUNDS) &&
         std::abs(before.top - after.top) <= (before.bottom - before.top) / 2 &&
         app.devices[app.active_device_index].id == L"fixture-usb" &&
         (ListView_GetGroupState(app.device_list, app.devices[0].list_group_id,
@@ -711,6 +711,26 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_COMMAND, kSettings, 0);
     ui_fixture_capture_channels = 2;
     ui_fixture_reverse_catalog = ui_fixture_omit_capture = false;
+    app.endpoints.clear();
+    for (const auto& role : {L"Playback 11/12", L"Loopback 5/6", L"playback 3/4", L"Playback 1/2", L"Loopback 1/2", L"Analog 1/2"}) {
+      auto endpoint = ui_fixture_endpoints()[1];
+      endpoint.pin_role = role;
+      endpoint.id = role;
+      app.endpoints.push_back(std::move(endpoint));
+    }
+    AudioSettings sorted_selection;
+    sorted_selection.channel_selection_configured = true;
+    sorted_selection.output_channel_keys = {L"Playback 11/12:ch=1"};
+    app.populating = true;
+    populate_device_list(app, sorted_selection);
+    app.populating = false;
+    std::vector<std::wstring> sorted_keys;
+    for (int row = 0; row < ListView_GetItemCount(app.device_list); row += 2)
+      sorted_keys.push_back(channel_key_at_row(app, row));
+    check(sorted_keys == std::vector<std::wstring>{L"Analog 1/2:ch=0", L"Loopback 1/2:ch=0", L"Loopback 5/6:ch=0",
+        L"Playback 1/2:ch=0", L"playback 3/4:ch=0", L"Playback 11/12:ch=0"} &&
+        channel_key_at_row(app, 11) == L"Playback 11/12:ch=1" && ListView_GetCheckState(app.device_list, 11),
+        "Natural name and number sorting keeps pairs adjacent and selected channel IDs intact");
     app.endpoints.clear();
     app.populating = true;
     populate_device_list(app, {});

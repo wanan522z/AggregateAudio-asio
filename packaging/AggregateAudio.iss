@@ -5,7 +5,7 @@
   #error Supply OutputDir.
 #endif
 #ifndef ReleaseNumber
-  #define ReleaseNumber 18
+  #define ReleaseNumber 19
 #endif
 #define DriverClsid "{D3AA79B2-9D91-4B6F-A2B1-55CE84C2A43D}"
 #ifdef PackagingTest
