@@ -118,9 +118,20 @@ BOOL WINAPI fake_ioctl(HANDLE pin, DWORD code, LPVOID input, DWORD input_size,
   }
   if (code == IOCTL_KS_PROPERTY && input) {
     const auto& property = *static_cast<const KSPROPERTY*>(input);
+    if (property.Flags == KSPROPERTY_TYPE_BASICSUPPORT) {
+      if (wave_rt && property.Set == KSPROPSETID_RtAudio &&
+          property.Id == KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION && output_size >= sizeof(ULONG)) {
+        *static_cast<ULONG*>(output) = KSPROPERTY_TYPE_GET;
+        *returned = sizeof(ULONG); return TRUE;
+      }
+      SetLastError(ERROR_NOT_SUPPORTED); return FALSE;
+    }
     if (property.Set == KSPROPSETID_Connection && property.Id == KSPROPERTY_CONNECTION_STATE) return TRUE;
     if (wave_rt && property.Set == KSPROPSETID_RtAudio) {
       if (property.Id == KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION) {
+        if (output_size < sizeof(KSRTAUDIO_BUFFER)) {
+          SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE;
+        }
         auto* buffer = static_cast<KSRTAUDIO_BUFFER*>(output);
         *buffer = {rt_samples.data(), static_cast<ULONG>(sizeof(rt_samples)), TRUE};
         *returned = sizeof(*buffer); return TRUE;

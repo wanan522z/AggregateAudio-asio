@@ -13,6 +13,7 @@
 #include <objbase.h>
 #include <avrt.h>
 #include <shellapi.h>
+#include "ks_device_access.h"
 
 #include "combase.h"
 #include "iasiodrv.h"
@@ -128,7 +129,7 @@ class AggregateASIO final : public IASIO, public CUnknown {
       canonicalize_endpoint_selections(settings_, endpoints_);
       std::string error;
       if (!engine_.initialize(settings_, endpoints_, error)) {
-        set_error(error);
+        report_engine_error(error);
         return ASIOFalse;
       }
       rebuild_channel_bindings();
@@ -177,7 +178,7 @@ class AggregateASIO final : public IASIO, public CUnknown {
       return ASE_HWMalfunction;
     }
     if (!engine_started) {
-      set_error(error);
+      report_engine_error(error);
       return ASE_HWMalfunction;
     }
     publish_sample_position(0, qpc_nanoseconds());
@@ -351,7 +352,7 @@ class AggregateASIO final : public IASIO, public CUnknown {
         std::string error;
         if (!engine_.initialize(settings_, endpoints_, error)) {
           engine_needs_refresh_.store(true, std::memory_order_release);
-          set_error(error);
+          report_engine_error(error);
           return ASE_HWMalfunction;
         }
         rebuild_channel_bindings();
@@ -485,6 +486,12 @@ class AggregateASIO final : public IASIO, public CUnknown {
   }
   void set_error(const std::string& message) {
     copy_message(error_message_, sizeof(error_message_), message);
+  }
+
+  void report_engine_error(const std::string& message) {
+    set_error(message);
+    if (ks_device_access::is_busy(engine_.last_status()))
+      MessageBoxW(nullptr, ks_device_access::kBusyMessage, L"设备被占用", MB_OK | MB_ICONWARNING);
   }
 
   bool is_channel_active(bool input, long channel) const {

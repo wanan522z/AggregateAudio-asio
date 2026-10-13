@@ -1,5 +1,6 @@
 #include "audio_engine.h"
 #include "buffer_plan.h"
+#include "ks_device_access.h"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -357,9 +358,13 @@ class EndpointAudioStream::Impl {
       error = "Could not create the Kernel Streaming worker events.";
       return false;
     }
-    const HRESULT hr = open_pin();
+    HRESULT hr = pin_reservation_.acquire(endpoint_.id);
+    if (SUCCEEDED(hr)) hr = open_pin();
     if (FAILED(hr)) {
-      error = "Could not create a KS pin for " + narrow(endpoint_.name) +
+      last_error_.store(hr, std::memory_order_release);
+      error = ks_device_access::is_busy(hr)
+          ? "Device is in use: " + narrow(endpoint_.name) + ". Release it and try again."
+          : "Could not create a KS pin for " + narrow(endpoint_.name) +
               " at a supported rate, channel count, and PCM format (" + hresult_text(hr) + ").";
       return false;
     }
@@ -551,6 +556,14 @@ class EndpointAudioStream::Impl {
           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (filter == INVALID_HANDLE_VALUE) {
         last_error = HRESULT_FROM_WIN32(GetLastError());
+        if (ks_device_access::is_busy(last_error)) return last_error;
+        continue;
+      }
+      const HRESULT availability = ks_device_access::check_pin(filter, candidate.pin_id);
+      if (FAILED(availability)) {
+        CloseHandle(filter);
+        if (ks_device_access::is_busy(availability)) return availability;
+        last_error = availability;
         continue;
       }
       auto rates = candidate.sample_rates.empty()
@@ -583,10 +596,20 @@ class EndpointAudioStream::Impl {
                     (static_cast<unsigned long long>(buffer_frames_) * rate + sample_rate_ - 1) /
                     std::max(1u, sample_rate_)), 16u, 8192u);
                 stream_frames_ = requested_stream_frames;
-                if (initialize_wave_rt(pin)) {
+                bool wave_rt_requested = false;
+                if (initialize_wave_rt(pin, wave_rt_requested)) {
                   pin_handle_ = pin;
                   CloseHandle(filter);
                   return S_OK;
+                }
+                if (!wave_rt_requested) {
+                  // An ordinary KS pin needs no close/reopen cycle when the
+                  // support query says WaveRT mapping is unavailable.
+                  pin_handle_ = pin;
+                  const bool initialized = initialize_transfer_buffers();
+                  if (!initialized) close_handle(pin_handle_);
+                  CloseHandle(filter);
+                  return initialized ? S_OK : E_OUTOFMEMORY;
                 }
                 unregister_wave_rt(pin);
                 CloseHandle(pin);
@@ -608,9 +631,17 @@ class EndpointAudioStream::Impl {
                   return E_OUTOFMEMORY;
                 }
                 last_error = HRESULT_FROM_WIN32(retry);
+                if (ks_device_access::is_busy(last_error)) {
+                  CloseHandle(filter);
+                  return last_error;
+                }
                 continue;
               }
               last_error = HRESULT_FROM_WIN32(status);
+              if (ks_device_access::is_busy(last_error)) {
+                CloseHandle(filter);
+                return last_error;
+              }
             }
           }
         }
@@ -645,7 +676,17 @@ class EndpointAudioStream::Impl {
     }
   }
 
-  bool initialize_wave_rt(HANDLE pin) noexcept {
+  bool initialize_wave_rt(HANDLE pin, bool& mapping_requested) noexcept {
+    // Query support before issuing a mapping request to an arbitrary KS driver.
+    KSPROPERTY support{};
+    support.Set = KSPROPSETID_RtAudio;
+    support.Id = KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION;
+    support.Flags = KSPROPERTY_TYPE_BASICSUPPORT;
+    ULONG access{};
+    ULONG support_bytes{};
+    if (!DeviceIoControl(pin, IOCTL_KS_PROPERTY, &support, sizeof(support),
+                         &access, sizeof(access), &support_bytes, nullptr) ||
+        support_bytes < sizeof(access) || !(access & KSPROPERTY_TYPE_GET)) return false;
     KSRTAUDIO_BUFFER_PROPERTY_WITH_NOTIFICATION request{};
     request.Property.Set = KSPROPSETID_RtAudio;
     request.Property.Id = KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION;
@@ -656,6 +697,7 @@ class EndpointAudioStream::Impl {
     request.NotificationCount = 2;
     KSRTAUDIO_BUFFER buffer{};
     ULONG returned = 0;
+    mapping_requested = true;
     if (!DeviceIoControl(pin, IOCTL_KS_PROPERTY, &request, sizeof(request),
                          &buffer, sizeof(buffer), &returned, nullptr) ||
         !buffer.BufferAddress || buffer.ActualBufferSize < block_align_ * 2) {
@@ -1108,6 +1150,7 @@ class EndpointAudioStream::Impl {
   }
 
   AudioEndpoint endpoint_;
+  ks_device_access::PinReservation pin_reservation_;
   unsigned sample_rate_;
   unsigned buffer_frames_;
   unsigned device_sample_rate_{};
@@ -1219,9 +1262,11 @@ bool AudioEngine::initialize(const AudioSettings& settings,
   stop();
   inputs_.clear();
   outputs_.clear();
+  last_status_ = S_OK;
   sample_rate_ = settings.sample_rate;
   buffer_frames_ = settings.buffer_frames;
   if (sample_rate_ < 8000 || sample_rate_ > 384000 || !buffer_frames_) {
+    last_status_ = E_INVALIDARG;
     error = "The saved sample rate or buffer size is invalid. Run the configurator first.";
     return false;
   }
@@ -1248,7 +1293,10 @@ bool AudioEngine::initialize(const AudioSettings& settings,
       const auto endpoint_buffer = device_buffer_frames(settings, found->device_instance_id);
       auto stream = std::unique_ptr<EndpointAudioStream>(
           new EndpointAudioStream(*found, sample_rate_, endpoint_buffer));
-      if (!stream->initialize(error)) return false;
+      if (!stream->initialize(error)) {
+        last_status_ = stream->last_status();
+        return false;
+      }
       stream->set_asio_sample_rate(sample_rate_);
       stream->set_asio_buffer_frames(buffer_frames_);
       destination.push_back(std::move(stream));
@@ -1263,7 +1311,12 @@ bool AudioEngine::initialize(const AudioSettings& settings,
     return false;
   }
   auto wait_for_streams = [&](auto& streams) {
-    for (auto& stream : streams) if (!stream->wait_initialized(error)) return false;
+    for (auto& stream : streams) {
+      if (!stream->wait_initialized(error)) {
+        last_status_ = stream->last_status();
+        return false;
+      }
+    }
     return true;
   };
   if (!wait_for_streams(inputs_) || !wait_for_streams(outputs_)) {
@@ -1273,6 +1326,7 @@ bool AudioEngine::initialize(const AudioSettings& settings,
     return false;
   }
   if (inputs_.empty() && outputs_.empty()) {
+    last_status_ = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     error = "No selected KS pins are available. Open the ASIO control panel and select devices.";
     return false;
   }
@@ -1280,12 +1334,14 @@ bool AudioEngine::initialize(const AudioSettings& settings,
 }
 
 bool AudioEngine::start(std::string& error) {
+  last_status_ = S_OK;
   auto request_streams = [&](auto& streams) {
     for (auto& stream : streams) if (!stream->request_start()) return false;
     return true;
   };
   if (!request_streams(inputs_) || !request_streams(outputs_)) {
     stop();
+    last_status_ = E_FAIL;
     error = "A KS pin worker is not available.";
     return false;
   }
@@ -1294,7 +1350,10 @@ bool AudioEngine::start(std::string& error) {
     for (auto& stream : streams) {
       const ULONGLONG now = GetTickCount64();
       const unsigned remaining = now < deadline ? static_cast<unsigned>(deadline - now) : 0;
-      if (!stream->wait_started(remaining, error)) return false;
+      if (!stream->wait_started(remaining, error)) {
+        last_status_ = stream->last_status();
+        return false;
+      }
     }
     return true;
   };

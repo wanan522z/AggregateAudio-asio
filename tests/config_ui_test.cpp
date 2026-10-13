@@ -1,11 +1,31 @@
 // Exercise real native controls with an in-memory catalog and profile. No audio
 // devices are opened and no user settings are read or saved.
 #include <cstdio>
+#include <objbase.h>
+#include "../src/ks_device_access.h"
+#include "../src/ks_probe.h"
+#include "../src/settings.h"
+namespace ks_device_access {
+HRESULT ui_fixture_check_endpoint(const AudioEndpoint& endpoint);
+}
+int WINAPI ui_fixture_message_box(HWND, LPCWSTR, LPCWSTR, UINT);
+bool ui_fixture_save_settings(const AudioSettings&);
+EndpointProbeResult ui_fixture_probe(const AudioEndpoint&, unsigned, unsigned, unsigned);
+std::vector<AudioEndpoint> ui_fixture_endpoints();
+AudioSettings ui_fixture_settings();
 #define enumerate_endpoints ui_fixture_endpoints
 #define load_audio_settings ui_fixture_settings
+#define check_endpoint ui_fixture_check_endpoint
+#define MessageBoxW ui_fixture_message_box
+#define save_audio_settings ui_fixture_save_settings
+#define probe_endpoint ui_fixture_probe
 #include "../src/config_ui.cpp"
 #undef enumerate_endpoints
 #undef load_audio_settings
+#undef check_endpoint
+#undef MessageBoxW
+#undef save_audio_settings
+#undef probe_endpoint
 
 #include <cstdio>
 
@@ -13,6 +33,28 @@ bool ui_fixture_first_profile = false;
 unsigned ui_fixture_capture_channels = 2;
 bool ui_fixture_reverse_catalog = false;
 bool ui_fixture_omit_capture = false;
+std::wstring ui_fixture_busy_id, ui_fixture_dialog;
+unsigned ui_fixture_saves{}, ui_fixture_dialogs{}, ui_fixture_probes{};
+bool ui_fixture_probe_busy{};
+
+HRESULT ks_device_access::ui_fixture_check_endpoint(const AudioEndpoint& endpoint) {
+  return endpoint.id == ui_fixture_busy_id ? HRESULT_FROM_WIN32(ERROR_BUSY) : S_OK;
+}
+int WINAPI ui_fixture_message_box(HWND, LPCWSTR text, LPCWSTR, UINT) {
+  ui_fixture_dialog = text;
+  ++ui_fixture_dialogs;
+  return IDOK;
+}
+bool ui_fixture_save_settings(const AudioSettings&) { ++ui_fixture_saves; return true; }
+EndpointProbeResult ui_fixture_probe(const AudioEndpoint&, unsigned, unsigned frames, unsigned) {
+  ++ui_fixture_probes;
+  EndpointProbeResult result;
+  result.hresult = ui_fixture_probe_busy ? HRESULT_FROM_WIN32(ERROR_BUSY) : S_OK;
+  result.stable = !ui_fixture_probe_busy;
+  result.actual_buffer_frames = frames;
+  result.actual_sample_rate = 48000;
+  return result;
+}
 
 std::vector<AudioEndpoint> ui_fixture_endpoints() {
   std::vector<AudioEndpoint> endpoints;
@@ -381,6 +423,46 @@ int wmain(int argc, wchar_t** argv) {
   RegisterClassW(&klass);
 
   bool passed = true;
+  {
+    AppState app;
+    app.tray_enabled = false;
+    const auto window = create_fixture_window(app, instance, L"Busy-device UI fixture");
+    if (!window) return 1;
+    const auto check = [&](bool condition, const char* label) {
+      std::printf("%s: %s\n", label, condition ? "PASS" : "FAIL");
+      passed = passed && condition;
+    };
+    ui_fixture_busy_id = L"fixture-pin-2";
+    ui_fixture_dialogs = ui_fixture_saves = 0;
+    ListView_SetCheckState(app.device_list, 4, TRUE);
+    check(!ListView_GetCheckState(app.device_list, 4) && ui_fixture_dialogs == 1 &&
+        ui_fixture_dialog.find(L"设备被占用，请释放后再试") != std::wstring::npos,
+        "Occupied channel is rejected with release-and-retry popup");
+    // Force a stale checkbox to simulate occupancy changing after selection.
+    app.populating = true;
+    ListView_SetCheckState(app.device_list, 4, TRUE);
+    app.populating = false;
+    save_profile(app);
+    check(ui_fixture_saves == 0 && ui_fixture_dialogs == 2,
+        "Save rechecks occupation before writing a profile or requesting reset");
+    start_auto_detect(app);
+    check(!app.probe_job && ui_fixture_dialogs == 3 && IsWindowEnabled(app.auto_detect),
+        "Occupied device never starts buffer detection");
+    ui_fixture_busy_id.clear();
+    ListView_SetCheckState(app.device_list, 4, FALSE);
+    ui_fixture_probe_busy = true;
+    ui_fixture_probes = 0;
+    const auto original_buffers = app.devices[0].buffer_frames;
+    start_auto_detect(app);
+    const auto deadline = GetTickCount64() + 2000;
+    while (app.probe_job && !app.probe_job->done.load() && GetTickCount64() < deadline) Sleep(1);
+    SendMessageW(window, WM_TIMER, kProbeTimer, 0);
+    check(app.probe_job && app.probe_job->done.load() && ui_fixture_probes == 1 &&
+        ui_fixture_dialogs == 4 && app.devices[0].buffer_frames == original_buffers &&
+        IsWindowEnabled(app.auto_detect), "Probe race aborts once and preserves buffer settings");
+    ui_fixture_probe_busy = false;
+    DestroyWindow(window);
+  }
   {
     AppState app;
     app.tray_enabled = false;

@@ -17,6 +17,13 @@ std::atomic<bool> bad_channel_data{};
 std::vector<ULONGLONG> output_times;
 std::atomic<unsigned> mock_packets{}, reset_requests{}, engine_initializations{};
 std::atomic<bool> mock_stalled{};
+bool mock_busy{};
+unsigned busy_dialogs{};
+
+int WINAPI fake_message_box(HWND, LPCWSTR text, LPCWSTR, UINT) {
+  if (std::wstring(text).find(L"设备被占用，请释放后再试") != std::wstring::npos) ++busy_dialogs;
+  return IDOK;
+}
 
 ULONGLONG host_timestamp_ms() {
   // GetTickCount64 can quantize a short handoff to a 15.6 ms tick. Measure the
@@ -49,13 +56,15 @@ struct TestStream {
 
 struct TestEngine {
   TestStream stream;
-  bool initialize(const AudioSettings&, const std::vector<AudioEndpoint>&, std::string&) {
+  bool initialize(const AudioSettings&, const std::vector<AudioEndpoint>&, std::string& error) {
     ++engine_initializations;
     mock_stalled = false;
+    if (mock_busy) { error = "Device is in use. Release it and try again."; return false; }
     return true;
   }
   bool start(std::string&) { return true; }
   void stop() {}
+  long last_status() const { return mock_busy ? HRESULT_FROM_WIN32(ERROR_BUSY) : S_OK; }
   void set_asio_sample_rate(unsigned) {}
   void set_asio_buffer_frames(unsigned) {}
   unsigned approximate_input_latency_frames() const { return 0; }
@@ -73,8 +82,10 @@ std::vector<AudioEndpoint> enumerate_endpoints() { return {}; }
 std::wstring channel_selection_key(const std::wstring& id, unsigned channel) { return id + std::to_wstring(channel); }
 
 #define AudioEngine TestEngine
+#define MessageBoxW fake_message_box
 #include "../src/asio_driver.cpp"
 #undef AudioEngine
+#undef MessageBoxW
 
 BOOL WINAPI DllEntryPoint(HINSTANCE, ULONG, LPVOID) { return TRUE; }
 LONG RegisterAsioDriver(CLSID, char*, char*, char*, char*) { return 0; }
@@ -265,5 +276,18 @@ int main() {
     passed = check_case(deferred, time_info, ready) && passed;
   }
   passed = check_device_recovery() && passed;
+  {
+    mock_busy = true;
+    HRESULT result = S_OK;
+    AggregateASIO driver(nullptr, &result);
+    const bool rejected = driver.init(nullptr) == ASIOFalse && busy_dialogs == 1;
+    char error[128]{};
+    driver.getErrorMessage(error);
+    const bool informed = std::string(error).find("Device is in use") != std::string::npos;
+    passed = rejected && informed && passed;
+    std::printf("ASIO rejects occupation and shows release-and-retry popup: %s\n",
+        rejected && informed ? "PASS" : "FAIL");
+    mock_busy = false;
+  }
   return passed ? 0 : 1;
 }

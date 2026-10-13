@@ -26,7 +26,7 @@ EndpointProbeResult probe_endpoint(const AudioEndpoint& endpoint,
   AudioEngine engine;
   std::string error;
   if (!engine.initialize(settings, {endpoint}, error)) {
-    result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    result.hresult = engine.last_status();
     return result;
   }
   auto* stream = endpoint.direction == Direction::input ? engine.input_stream(0)

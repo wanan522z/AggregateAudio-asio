@@ -12,6 +12,7 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <windows.h>
+#include "ks_device_access.h"
 
 #include <algorithm>
 #include <array>
@@ -70,6 +71,7 @@ struct ProbeJob {
   std::mutex mutex;
   std::wstring latest_message;
   std::vector<DeviceBufferSetting> result_device_buffers;
+  std::wstring access_error;
   std::atomic_bool cancelled{};
   std::atomic_bool done{};
   std::atomic_bool passed{};
@@ -745,6 +747,54 @@ void fill_buffer_combo(HWND combo, unsigned selected) {
   select_combo_value(combo, selected);
 }
 
+void show_device_access_error(AppState& app, const AudioEndpoint& endpoint, long status) {
+  const auto name = endpoint.name.empty() ? endpoint.device_name : endpoint.name;
+  const std::wstring message = name + L"\n\n" +
+      (ks_device_access::is_busy(status) ? ks_device_access::kBusyMessage
+          : L"无法访问设备，请检查设备连接和驱动后再试。");
+  append_log(app, message);
+  MessageBoxW(app.window, message.c_str(),
+      ks_device_access::is_busy(status) ? L"设备被占用" : L"设备不可用", MB_OK | MB_ICONWARNING);
+}
+
+bool driver_is_open() {
+  const HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, kSettingsChangedEventName);
+  if (!event) return false;
+  CloseHandle(event);
+  return true;
+}
+
+bool check_selected_device_access(AppState& app, bool allow_existing_driver_pins) {
+  const bool existing_driver = allow_existing_driver_pins && driver_is_open();
+  const auto selection = selection_from_current_ui(app);
+  for (const auto& endpoint : app.endpoints) {
+    if (!selection_contains_endpoint(selection, endpoint)) continue;
+    // Editing an already selected pin changes metadata, without a second open.
+    // Buffer detection, in contrast, always needs its own streaming pin.
+    if (existing_driver && selection_contains_endpoint(app.saved_settings, endpoint)) continue;
+    const auto status = ks_device_access::check_endpoint(endpoint);
+    if (FAILED(status)) {
+      show_device_access_error(app, endpoint, status);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool can_enable_channel(AppState& app, size_t channel_index) {
+  if (channel_index >= app.channels.size()) return false;
+  const auto endpoint_index = app.channels[channel_index].endpoint_index;
+  for (const auto checked : checked_channel_indices(app)) {
+    if (checked != channel_index && app.channels[checked].endpoint_index == endpoint_index) return true;
+  }
+  const auto& endpoint = app.endpoints[endpoint_index];
+  if (driver_is_open() && selection_contains_endpoint(app.saved_settings, endpoint)) return true;
+  const auto status = ks_device_access::check_endpoint(endpoint);
+  if (SUCCEEDED(status)) return true;
+  show_device_access_error(app, endpoint, status);
+  return false;
+}
+
 void save_profile(AppState& app) {
   AudioSettings settings = selection_from_current_ui(app);
   if (settings.input_channel_keys.empty() && settings.output_channel_keys.empty()) {
@@ -759,6 +809,7 @@ void save_profile(AppState& app) {
   settings.sample_rate = selected_sample_rate(app);
   settings.buffer_frames = combo_value(app.asio_buffer, 128);
   settings.initialized = true;
+  if (!check_selected_device_access(app, true)) return;
   if (!save_audio_settings(settings)) {
     MessageBoxW(app.window, L"设置保存失败。请检查当前 Windows 用户的 Local AppData 权限。",
                 L"保存失败", MB_OK | MB_ICONERROR);
@@ -823,6 +874,7 @@ void start_auto_detect(AppState& app) {
                 MB_OK | MB_ICONINFORMATION);
     return;
   }
+  if (!check_selected_device_access(app, false)) return;
 
   const auto sample_rate = selected_sample_rate(app);
   const HWND window = app.window;
@@ -852,6 +904,15 @@ void start_auto_detect(AppState& app) {
           for (const auto& endpoint : device.endpoints) {
             if (job->cancelled.load()) break;
             const auto result = probe_endpoint(endpoint, sample_rate, candidate, 400);
+            if (ks_device_access::is_busy(result.hresult)) {
+              std::lock_guard lock(job->mutex);
+              job->access_error = device.name + L" / " + endpoint.pin_role + L"\n\n" +
+                  ks_device_access::kBusyMessage;
+              job->latest_message = job->access_error;
+              job->passed.store(false);
+              job->done.store(true);
+              return;
+            }
             std::wstring probe_message = device.name + L" / " + endpoint.pin_role + L"：";
             probe_message += result.stable ? L"短时通过，" : L"未通过，";
             probe_message += std::to_wstring(result.actual_buffer_frames) + L" 帧 / " +
@@ -1266,6 +1327,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (header->idFrom == kDeviceList && header->code == NM_CUSTOMDRAW) {
         return config_theme::draw_list(app->theme, *reinterpret_cast<NMLVCUSTOMDRAW*>(lparam));
       }
+      if (header->idFrom == kDeviceList && header->code == LVN_ITEMCHANGING && !app->populating) {
+        const auto* change = reinterpret_cast<const NMLISTVIEW*>(lparam);
+        const bool enabling = (change->uChanged & LVIF_STATE) &&
+            (change->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK(2) &&
+            (change->uOldState & LVIS_STATEIMAGEMASK) != INDEXTOSTATEIMAGEMASK(2);
+        if (enabling && !can_enable_channel(*app, static_cast<size_t>(change->iItem))) return TRUE;
+      }
       if (header->idFrom == kDeviceList && header->code == LVN_ITEMCHANGED && !app->populating) {
         const auto* change = reinterpret_cast<const NMLISTVIEW*>(lparam);
         const bool checkbox_changed = (change->uChanged & LVIF_STATE) &&
@@ -1338,12 +1406,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         bool done = false;
         bool passed = false;
         std::vector<DeviceBufferSetting> results;
+        std::wstring access_error;
         {
           std::lock_guard lock(app->probe_job->mutex);
           progress_text = app->probe_job->latest_message;
           done = app->probe_job->done.load();
           passed = app->probe_job->passed.load();
-          if (done) results = app->probe_job->result_device_buffers;
+          if (done) {
+            results = app->probe_job->result_device_buffers;
+            access_error = app->probe_job->access_error;
+          }
         }
         if (!progress_text.empty() && progress_text != app->last_probe_message) {
           app->last_probe_message = progress_text;
@@ -1352,6 +1424,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (done) {
           KillTimer(window, kProbeTimer);
           set_probe_controls_enabled(*app, true);
+          if (!access_error.empty()) {
+            MessageBoxW(window, access_error.c_str(), L"设备被占用", MB_OK | MB_ICONWARNING);
+            return 0;
+          }
           for (const auto& result : results) {
             const auto found = std::find_if(app->devices.begin(), app->devices.end(),
                 [&](const auto& device) { return same_text(device.id, result.device_id); });

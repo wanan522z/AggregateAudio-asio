@@ -77,6 +77,7 @@ class AudioEngine {
                   std::string& error);
   bool start(std::string& error);
   void stop() noexcept;
+  long last_status() const noexcept { return last_status_; }
   void set_asio_sample_rate(unsigned rate) noexcept;
   void set_asio_buffer_frames(unsigned frames) noexcept;
   unsigned approximate_input_latency_frames() const noexcept;
@@ -92,6 +93,7 @@ class AudioEngine {
  private:
   unsigned sample_rate_{48000};
   unsigned buffer_frames_{128};
+  long last_status_{};
   std::vector<std::unique_ptr<EndpointAudioStream>> inputs_;
   std::vector<std::unique_ptr<EndpointAudioStream>> outputs_;
 };
